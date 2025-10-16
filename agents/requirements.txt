@@ -1,0 +1,5 @@
+# Coordinator Agent Requirements
+# This agent orchestrates the entire agentic chat pipeline
+
+boto3>=1.34.0
+botocore>=1.34.0

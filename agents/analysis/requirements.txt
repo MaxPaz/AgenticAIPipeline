@@ -1,0 +1,5 @@
+# Analysis Agent Requirements
+# This agent interprets query results and generates business insights
+
+boto3>=1.34.0
+botocore>=1.34.0

@@ -1,4 +1,4 @@
-# QueenAI Agentic Chat Pipeline
+# AI Agentic Chat Pipeline
 
 An advanced multi-agent system for intelligent business data querying using AWS Bedrock Agents. This system provides a conversational interface for analyzing business KPIs and transactional data with AI-powered insights and dynamic follow-up questions.
 
@@ -215,10 +215,6 @@ For detailed architecture information, see [BEDROCK_AGENT_ARCHITECTURE.md](BEDRO
 2. Make your changes
 3. Test thoroughly
 4. Submit a pull request
-
-## License
-
-Proprietary - QueenAI
 
 ## Support
 

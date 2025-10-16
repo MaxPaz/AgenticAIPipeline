@@ -1,0 +1,108 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Get Available KPIs API",
+    "version": "1.0.0",
+    "description": "API for retrieving available KPIs for a given customer"
+  },
+  "paths": {
+    "/get_available_kpis": {
+      "post": {
+        "summary": "Get available KPIs for a customer",
+        "description": "Returns all available KPIs for the specified customer, including KPI ID, name, definition, unit, and group. The agent can then select appropriate KPIs based on the user's question.",
+        "operationId": "getAvailableKpis",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "customer": {
+                    "type": "string",
+                    "description": "Customer name or 'all' to get KPIs for all customers",
+                    "example": "Customer A"
+                  }
+                },
+                "required": [
+                  "customer"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response with available KPIs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "customer": {
+                      "type": "string",
+                      "description": "Customer name that was queried"
+                    },
+                    "kpi_count": {
+                      "type": "integer",
+                      "description": "Number of KPIs returned"
+                    },
+                    "kpis": {
+                      "type": "array",
+                      "description": "List of available KPIs",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "kpi_id": {
+                            "type": "integer",
+                            "description": "Unique KPI identifier"
+                          },
+                          "kpi_name": {
+                            "type": "string",
+                            "description": "Name of the KPI"
+                          },
+                          "definition": {
+                            "type": "string",
+                            "description": "Short definition explaining what the KPI measures"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "description": "Unit of measurement (e.g., 'currency', 'percentage', 'number')"
+                          },
+                          "group": {
+                            "type": "string",
+                            "description": "Group or category the KPI belongs to"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Error message"
+                    },
+                    "kpis": {
+                      "type": "array",
+                      "description": "Empty array on error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

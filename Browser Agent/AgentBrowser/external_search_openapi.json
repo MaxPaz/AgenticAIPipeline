@@ -1,0 +1,186 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "External Search API",
+    "description": "API for searching external web sources and extracting information using browser automation",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/search_company_info": {
+      "post": {
+        "summary": "Search for company information",
+        "description": "Search the web for information about a specific company including news, financial data, or general information",
+        "operationId": "searchCompanyInfo",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "company_name": {
+                    "type": "string",
+                    "description": "Name of the company to search for"
+                  },
+                  "search_type": {
+                    "type": "string",
+                    "enum": ["news", "general", "financial"],
+                    "default": "general",
+                    "description": "Type of information to search for: news (recent news articles), general (company overview), or financial (financial metrics)"
+                  }
+                },
+                "required": ["company_name"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful search",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "description": "Whether the search was successful"
+                    },
+                    "company_name": {
+                      "type": "string",
+                      "description": "Name of the company searched"
+                    },
+                    "search_type": {
+                      "type": "string",
+                      "description": "Type of search performed"
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "Search results and extracted information"
+                    },
+                    "source": {
+                      "type": "string",
+                      "description": "Source of the information"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/extract_web_data": {
+      "post": {
+        "summary": "Extract data from a specific URL",
+        "description": "Navigate to a specific URL and extract information based on provided instructions",
+        "operationId": "extractWebData",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "description": "URL to navigate to and extract data from"
+                  },
+                  "extraction_instructions": {
+                    "type": "string",
+                    "description": "Specific instructions for what data to extract from the page"
+                  }
+                },
+                "required": ["url", "extraction_instructions"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "description": "Whether the extraction was successful"
+                    },
+                    "url": {
+                      "type": "string",
+                      "description": "URL that was accessed"
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "Extracted data from the webpage"
+                    },
+                    "source": {
+                      "type": "string",
+                      "description": "Source URL"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/custom_browse": {
+      "post": {
+        "summary": "Execute custom browsing action",
+        "description": "Execute a custom web browsing action using natural language instructions",
+        "operationId": "customBrowse",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "prompt": {
+                    "type": "string",
+                    "description": "Natural language instruction for the browsing action (e.g., 'Go to Amazon.com and find the latest news', 'Search Google for Tesla stock price')"
+                  }
+                },
+                "required": ["prompt"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful browsing action",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "description": "Whether the action was successful"
+                    },
+                    "prompt": {
+                      "type": "string",
+                      "description": "The instruction that was executed"
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "Result of the browsing action"
+                    },
+                    "source": {
+                      "type": "string",
+                      "description": "Source of the information"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

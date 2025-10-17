@@ -3,6 +3,9 @@
 ## Overview
 
 This directory contains AWS CDK infrastructure code to deploy the Bedrock Coordinator Agent.
+Due to current CDK limitations, the infrastructre needs manual support to be created.
+
+This project was built with Kiro --> https://kiro.dev/
 
 ## Prerequisites
 

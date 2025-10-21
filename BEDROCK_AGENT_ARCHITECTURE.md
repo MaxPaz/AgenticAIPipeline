@@ -110,18 +110,6 @@ This project implements a **4-agent architecture** using **AWS Bedrock Agents** 
 - They exist only as **reference implementations** and **documentation**
 - **All orchestration happens in Bedrock Console** via Agent Collaboration
 
-### ✅ What IS Used
-- `ui/app.py` - Streamlit UI that calls Bedrock
-- `lambda/get_kpi_data/lambda_function.py` - Lambda for KPI retrieval
-- `lambda/sql_executor/lambda_function.py` - Lambda for SQL execution
-- Bedrock Agent configurations (in AWS Console)
-
-### ❌ What is NOT Used
-- `agents/coordinator_agent.py` - DELETED (was misleading)
-- `agents/data_source/data_source_agent.py` - Reference only
-- `agents/smart_retrieval/smart_retrieval_agent.py` - Reference only
-- `agents/analysis/analysis_agent.py` - Reference only
-
 ## How to Implement This in Your AWS Account
 
 ### Step 1: Create Lambda Functions

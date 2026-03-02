@@ -2,7 +2,7 @@
 QueenAI Agentic Chat Pipeline - Streamlit UI
 
 This Streamlit application provides an interactive chat interface for the agentic chat pipeline.
-It integrates with the Bedrock Coordinator Agent to provide:
+It integrates with the AgentCore Runtime to provide:
 - Real-time streaming responses
 - Progress updates showing agent workflow stages
 - Session management for conversation continuity
@@ -13,15 +13,14 @@ It integrates with the Bedrock Coordinator Agent to provide:
 import streamlit as st
 import uuid
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from datetime import datetime
+from typing import Dict, Any, List
 import boto3
 from botocore.config import Config
 import json
 import os
 import logging
 from dotenv import load_dotenv
-import threading
 
 # Load environment variables
 load_dotenv()
@@ -37,86 +36,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def fetch_token_usage_from_cloudwatch(session_id: str, start_time: float, end_time: float) -> Dict[str, int]:
-    """
-    Fetch token usage from CloudWatch Logs for a specific query.
-    
-    Args:
-        session_id: Bedrock session ID
-        start_time: Query start time (unix timestamp)
-        end_time: Query end time (unix timestamp)
-        
-    Returns:
-        Dictionary with total_input_tokens and total_output_tokens
-    """
-    try:
-        logs_client = boto3.client('logs', region_name=os.getenv('AWS_REGION', 'us-west-2'))
-        log_group = 'BedrockLogging'  # Correct log group name without leading slash
-        
-        # Convert to milliseconds with tight time window
-        # Use a narrow window to capture only this specific query
-        start_ms = int(start_time * 1000)  # Exact start time
-        end_ms = int((end_time + 3) * 1000)  # 3 second buffer after for log delays
-        
-        # Query for model invocation logs with usage data
-        # The actual structure is: output.outputBodyJson.usage.inputTokens
-        query = '''
-        fields @timestamp, output.outputBodyJson.usage.inputTokens as inputTokens, output.outputBodyJson.usage.outputTokens as outputTokens
-        | filter ispresent(inputTokens)
-        | stats sum(inputTokens) as total_input, sum(outputTokens) as total_output
-        '''
-        
-        logger.info(f"CloudWatch query time window: {start_time} to {end_time} ({end_time - start_time:.1f}s duration)")
-        
-        query_response = logs_client.start_query(
-            logGroupName=log_group,
-            startTime=start_ms,
-            endTime=end_ms,
-            queryString=query,
-            limit=1000
-        )
-        
-        query_id = query_response['queryId']
-        
-        # Wait for query to complete (max 3 seconds)
-        for _ in range(6):
-            time.sleep(0.5)
-            result = logs_client.get_query_results(queryId=query_id)
-            
-            if result['status'] == 'Complete':
-                if result['results'] and len(result['results']) > 0:
-                    # Parse results
-                    result_fields = {item['field']: item['value'] for item in result['results'][0]}
-                    total_input = int(float(result_fields.get('total_input', 0)))
-                    total_output = int(float(result_fields.get('total_output', 0)))
-                    
-                    logger.info(f"Fetched token usage: {total_input} input, {total_output} output")
-                    return {
-                        'total_input_tokens': total_input,
-                        'total_output_tokens': total_output,
-                        'total_tokens': total_input + total_output
-                    }
-                break
-            elif result['status'] == 'Failed':
-                logger.warning(f"CloudWatch query failed: {result.get('statistics', {})}")
-                break
-        
-        logger.warning("CloudWatch query timed out or returned no results")
-        return {'total_input_tokens': 0, 'total_output_tokens': 0, 'total_tokens': 0}
-        
-    except Exception as e:
-        logger.error(f"Error fetching token usage from CloudWatch: {e}")
-        return {'total_input_tokens': 0, 'total_output_tokens': 0, 'total_tokens': 0}
+# ---------------------------------------------------------------------------
+# Task 7.3 — Validate required environment variables at startup
+# ---------------------------------------------------------------------------
+_AGENTCORE_AGENT_ID = os.getenv('AGENTCORE_AGENT_ID', '')
+_AWS_REGION = os.getenv('AWS_REGION', 'us-west-2')
+_AWS_ACCOUNT_ID = os.getenv('AWS_ACCOUNT_ID', '')  # optional — avoids STS call if set
 
 
-# Page configuration
+# Page configuration (must come before any other st calls)
 st.set_page_config(
     page_title="QueenAI Chat",
     page_icon="👑",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Check required env vars before rendering anything else
+_missing_vars = []
+if not _AGENTCORE_AGENT_ID:
+    _missing_vars.append('AGENTCORE_AGENT_ID')
+
+if _missing_vars:
+    st.error(
+        f"Missing required environment variable(s): {', '.join(_missing_vars)}. "
+        "Please set them in your .env file or environment and restart the app."
+    )
+    st.stop()
 
 # Custom CSS for better UI
 st.markdown("""
@@ -203,51 +149,69 @@ st.markdown("""
 
 def initialize_session_state():
     """Initialize session state variables."""
+    # Task 7.4 — Session ID via uuid4
     if 'session_id' not in st.session_state:
-        st.session_state.session_id = str(uuid.uuid4())
-        logger.info(f"New session created: {st.session_state.session_id}")
-    
+        user_id = st.query_params.get("user", "demo_user")
+        chat_slot = st.query_params.get("chat", "1")
+        # runtimeSessionId requires min 33 chars — pad with a stable hash
+        import hashlib
+        base = f"{user_id}_chat_{chat_slot}"
+        suffix = hashlib.md5(base.encode()).hexdigest()
+        st.session_state.session_id = f"{base}_{suffix}"
+        logger.info(f"Session ID set: {st.session_state.session_id}")
+
     if 'messages' not in st.session_state:
         st.session_state.messages = []
         logger.info("Initialized empty message history")
-    
-    if 'bedrock_client' not in st.session_state:
-        # Configure boto3 client with extended timeout for Bedrock service hiccups
+
+    # Task 7.1 — AgentCore Runtime client (bedrock-agentcore)
+    if 'agentcore_client' not in st.session_state:
         config = Config(
-            read_timeout=180,  # Increased from default 60s to handle service delays
+            read_timeout=180,
             connect_timeout=10,
             retries={'max_attempts': 3, 'mode': 'adaptive'}
         )
-        st.session_state.bedrock_client = boto3.client(
-            'bedrock-agent-runtime',
-            region_name=os.getenv('AWS_REGION', 'us-west-2'),
+        st.session_state.agentcore_client = boto3.client(
+            'bedrock-agentcore',
+            region_name=_AWS_REGION,
             config=config
         )
-    
-    if 'agent_id' not in st.session_state:
-        st.session_state.agent_id = os.getenv('BEDROCK_AGENT_ID', 'IVOZ9TEFQZ')
-    
-    if 'agent_alias_id' not in st.session_state:
-        st.session_state.agent_alias_id = os.getenv('BEDROCK_AGENT_ALIAS_ID', 'UPB6NZO4RU')
-    
+
+    # Task 7.1 — AgentCore agent ID from env var
+    if 'agentcore_agent_id' not in st.session_state:
+        st.session_state.agentcore_agent_id = _AGENTCORE_AGENT_ID
+
+    # Build and cache the full ARN (avoids STS call on every message)
+    if 'agentcore_agent_arn' not in st.session_state:
+        if _AWS_ACCOUNT_ID:
+            # Fast path — no STS call needed
+            account_id = _AWS_ACCOUNT_ID
+        else:
+            t_sts = time.time()
+            account_id = boto3.client('sts', region_name=_AWS_REGION).get_caller_identity()['Account']
+            logger.info(f"[TIMING] STS get_caller_identity: {time.time() - t_sts:.3f}s")
+        st.session_state.agentcore_agent_arn = (
+            f"arn:aws:bedrock-agentcore:{_AWS_REGION}:{account_id}:runtime/{_AGENTCORE_AGENT_ID}"
+        )
+        logger.info(f"[TIMING] Agent ARN cached: {st.session_state.agentcore_agent_arn}")
+
     if 'org_id' not in st.session_state:
         st.session_state.org_id = "default"
-    
+
     if 'user_id' not in st.session_state:
-        st.session_state.user_id = "demo_user"
-    
+        # Use ?user= URL param for stable identity across page refreshes
+        # e.g. http://localhost:8501/?user=maxpaz
+        st.session_state.user_id = st.query_params.get("user", "demo_user")
+
     if 'total_latency' not in st.session_state:
         st.session_state.total_latency = 0
-    
+
     if 'message_count' not in st.session_state:
         st.session_state.message_count = 0
-    
+
     if 'stage_latencies' not in st.session_state:
         st.session_state.stage_latencies = {}
-    
-    if 'search_mode' not in st.session_state:
-        st.session_state.search_mode = 'internal'  # 'internal' or 'web'
-    
+
     if 'suggested_questions' not in st.session_state:
         st.session_state.suggested_questions = []
 
@@ -260,17 +224,17 @@ def get_stage_badge(stage: str) -> str:
         'analysis': 'stage-analysis',
         'response': 'stage-response'
     }
-    
+
     stage_names = {
         'data_source': '📊 Data Source',
         'retrieval': '🔍 Retrieval',
         'analysis': '📈 Analysis',
         'response': '💬 Response'
     }
-    
+
     css_class = stage_classes.get(stage, 'stage-badge')
     name = stage_names.get(stage, stage.title())
-    
+
     return f'<span class="stage-badge {css_class}">{name}</span>'
 
 
@@ -278,49 +242,38 @@ def display_timeline(events: List[Dict[str, Any]], start_time: float, completed:
     """Display agent execution timeline with timing."""
     if not events:
         return
-    
-    # Build timeline HTML
+
     timeline_html = '<div style="background: #f8f9fa; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0;">'
     timeline_html += '<div style="font-weight: bold; margin-bottom: 0.5rem;">🔄 Agent Execution Timeline</div>'
-    
-    agent_colors = {
-        'DataSourceAgent': '#2196F3',
-        'SmartRetrievalAgent': '#9C27B0',
-        'AnalysisAgent': '#4CAF50',
-        'User': '#FF9800'
+
+    tool_colors = {
+        'get_kpi_data': '#2196F3',
+        'execute_sql_query': '#9C27B0',
+        'web_search': '#4CAF50',
+        'get_available_kpis': '#FF9800',
+        'data_specialist': '#F44336',
+        'analysis': '#00BCD4',
     }
-    
-    current_time = 0
+
     for event in events:
-        if event['type'] == 'agent_start':
-            agent = event['agent']
-            elapsed = event['time']
-            color = agent_colors.get(agent, '#757575')
-            
+        if event['type'] == 'tool_use':
+            tool_name = event.get('name', 'unknown')
+            elapsed = event.get('time', 0)
+            color = tool_colors.get(tool_name, '#757575')
+
             timeline_html += f'''
             <div style="margin: 0.5rem 0; padding: 0.5rem; background: white; border-left: 4px solid {color}; border-radius: 0.3rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-weight: 500;">🤖 {agent}</span>
+                    <span style="font-weight: 500;">🔧 {tool_name}</span>
                     <span style="color: #666; font-size: 0.85rem;">{elapsed:.2f}s</span>
                 </div>
             </div>
             '''
-            current_time = elapsed
-        
-        elif event['type'] == 'agent_complete':
-            agent = event['agent']
-            duration = event['duration']
-            
-            timeline_html += f'''
-            <div style="margin-left: 2rem; color: #666; font-size: 0.85rem;">
-                ✓ Completed in {duration:.2f}s
-            </div>
-            '''
-        
-        elif event['type'] == 'lambda_call':
-            action = event['action']
-            elapsed = event['time']
-            
+
+        elif event['type'] == 'lambda':
+            action = event.get('name', 'unknown')
+            elapsed = event.get('time', 0)
+
             timeline_html += f'''
             <div style="margin: 0.5rem 0 0.5rem 2rem; padding: 0.4rem; background: #FFF3E0; border-left: 3px solid #FF9800; border-radius: 0.3rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -329,352 +282,98 @@ def display_timeline(events: List[Dict[str, Any]], start_time: float, completed:
                 </div>
             </div>
             '''
-    
+
     if completed:
         timeline_html += '<div style="margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid #ddd; color: #4CAF50; font-weight: 500;">✓ Workflow Complete</div>'
-    
+
     timeline_html += '</div>'
-    
     st.markdown(timeline_html, unsafe_allow_html=True)
 
 
 def display_message(message: Dict[str, Any]):
-    """Display a chat message with appropriate styling."""
+    """Display a chat message using st.chat_message for proper markdown rendering."""
     role = message.get('role', 'user')
     content = message.get('content', '')
     timestamp = message.get('timestamp', '')
     metadata = message.get('metadata', {})
-    
+
     if role == 'user':
-        st.markdown(f"""
-        <div class="chat-message user-message">
-            <div><strong>You</strong> <span style="color: #888; font-size: 0.8rem;">{timestamp}</span></div>
-            <div style="margin-top: 0.5rem;">{content}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        with st.chat_message("user"):
+            st.markdown(content)
+            st.caption(timestamp)
+
     elif role == 'assistant':
-        st.markdown(f"""
-        <div class="chat-message assistant-message">
-            <div><strong>QueenAI Assistant</strong> <span style="color: #888; font-size: 0.8rem;">{timestamp}</span></div>
-            <div style="margin-top: 0.5rem;">{content}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Display latency info if available
-        if 'latency' in metadata:
-            st.markdown(f"""
-            <div class="latency-info">
-                ⏱️ Response time: {metadata['latency']:.2f}s
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Display timeline if available
-        if 'timeline' in metadata and metadata['timeline']:
-            with st.expander("🔍 View Agentic Workflow Execution", expanded=False):
-                timeline = metadata['timeline']
-                lambda_calls = [e for e in timeline if e['type'] == 'lambda']
-                total_time = metadata.get('latency', 0)
-                
-                # Calculate agent timing estimates
-                if lambda_calls:
-                    first_lambda = lambda_calls[0]['time']
-                    last_lambda = lambda_calls[-1]['time']
-                    
-                    # Estimate agent times
-                    coordinator_time = first_lambda
-                    data_source_time = first_lambda
-                    retrieval_time = last_lambda - first_lambda
-                    analysis_time = total_time - last_lambda
-                    
-                    st.markdown("### 🤖 Autonomous Agent Workflow\n")
-                    
-                    # Show workflow with coordinator orchestrating
-                    st.markdown(f"**Coordinator Agent** - Orchestrates entire workflow (`{total_time:.1f}s total`)")
-                    st.markdown(f"  ↓ *Routes to* **Data Source Agent** `~{data_source_time:.1f}s` - Identified KPIs, determined data sources")
-                    st.markdown(f"  ↓ *Routes to* **Smart Retrieval Agent** `~{retrieval_time:.1f}s` - Retrieved data autonomously ({len(lambda_calls)} data calls)")
-                    
-                    # Show unique data retrieval actions
-                    seen_actions = {}
-                    for event in lambda_calls:
-                        action_name = event['name'].split('/')[-1].replace('_', ' ').title()
-                        if action_name not in seen_actions:
-                            seen_actions[action_name] = []
-                        seen_actions[action_name].append(event['time'])
-                    
-                    for action_name, times in seen_actions.items():
-                        if len(times) == 1:
-                            st.markdown(f"      - 📊 {action_name} at {times[0]:.1f}s")
-                        else:
-                            st.markdown(f"      - 📊 {action_name} ({len(times)}x) at {times[0]:.1f}s, {times[-1]:.1f}s")
-                    
-                    st.markdown(f"  ↓ *Routes to* **Analysis Agent** `~{analysis_time:.1f}s` - Generated insights and formatted response")
-                    st.markdown(f"  ↓ *Returns final answer to user*")
-                    
-                    # Display token usage if available
-                    if 'token_usage' in metadata and metadata['token_usage'].get('total_tokens', 0) > 0:
-                        token_info = metadata['token_usage']
-                        st.markdown("---")
-                        st.markdown("### 🎯 Token Usage")
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Input Tokens", f"{token_info['total_input_tokens']:,}")
-                        with col2:
-                            st.metric("Output Tokens", f"{token_info['total_output_tokens']:,}")
-                        with col3:
-                            st.metric("Total Tokens", f"{token_info['total_tokens']:,}")
+        with st.chat_message("assistant"):
+            # Escape $ signs to prevent Streamlit treating them as LaTeX math delimiters
+            safe_content = content.replace("$", r"\$")
+            st.markdown(safe_content)
 
-    
-    elif role == 'progress':
-        stage = metadata.get('stage', '')
-        badge = get_stage_badge(stage)
-        st.markdown(f"""
-        <div class="progress-update">
-            {badge} {content}
-        </div>
-        """, unsafe_allow_html=True)
-    
+            latency = metadata.get('latency', 0)
+            timing_ui = metadata.get('timing', {})
+            agent_timing = metadata.get('agent_timing', {})
+            invoke_ms = timing_ui.get('invoke_ms', 0)
+            read_ms = timing_ui.get('read_ms', 0)
+            agent_total_ms = agent_timing.get('total_ms', 0)
+            coordinator_ms = agent_timing.get('coordinator_ms', 0)
+            ui_overhead_ms = max(0, int(latency * 1000) - invoke_ms - read_ms)
+            network_ms = max(0, invoke_ms - agent_total_ms) if agent_total_ms else invoke_ms
+            events = agent_timing.get('events', [])
+
+            st.caption(f"⏱️ {latency:.2f}s  ·  {timestamp}")
+
+            # Suggested questions as clickable buttons
+            suggested = metadata.get('suggested_questions', [])
+            if suggested:
+                st.markdown("**Suggested follow-up questions:**")
+                cols = st.columns(min(len(suggested), 2))
+                for i, q in enumerate(suggested):
+                    with cols[i % 2]:
+                        if st.button(q, key=f"sq_{hash(q)}_{timestamp}", use_container_width=True):
+                            st.session_state.user_input = q
+                            st.rerun()
+
+            # Timing breakdown
+            with st.expander("🔍 Full Timing Breakdown", expanded=False):
+                rows = [
+                    f"| 🖥️ UI overhead | {ui_overhead_ms} ms |",
+                    f"| 🌐 Network to AgentCore | {network_ms} ms |",
+                ]
+                if coordinator_ms:
+                    tool_total = sum(e['ms'] for e in events)
+                    coord_model_ms = max(0, coordinator_ms - tool_total)
+                    rows.append(f"| 🎯 Coordinator | {coord_model_ms} ms |")
+                for e in events:
+                    label, ms = e['label'], e['ms']
+                    agent = e.get('agent', 'coordinator')
+                    prefix = "🎯 [coordinator]" if agent == "coordinator" else "🔬 [data_specialist]"
+                    if label == 'lambda:get_available_kpis':
+                        rows.append(f"| {prefix} Lambda: get_available_kpis | {ms} ms |")
+                    elif label == 'nova:nova_grounding_search':
+                        rows.append(f"| 🌐 Web Search | {ms} ms |")
+                    elif label == 'agent:data_specialist':
+                        rows.append(f"| 🔬 Data Specialist | {ms} ms |")
+                    elif label == 'agent:analysis':
+                        rows.append(f"| 📊 Analysis Agent | {ms} ms |")
+                    elif label == 'agent:router':
+                        rows.append(f"| 🎯 Router | {ms} ms |")
+                    elif label.startswith('lambda:'):
+                        rows.append(f"| {prefix} Lambda: {label[7:]} | {ms} ms |")
+                    else:
+                        rows.append(f"| {prefix} {label} | {ms} ms |")
+                rows.append(f"| 📥 Response read | {read_ms} ms |")
+                rows.append(f"| **Total** | **{int(latency * 1000)} ms** |")
+                st.markdown("| Stage | Time |\n|---|---|\n" + "\n".join(rows))
+
     elif role == 'error':
-        st.markdown(f"""
-        <div class="error-message">
-            <strong>⚠️ Error</strong><br>
-            {content}
-        </div>
-        """, unsafe_allow_html=True)
-
-
-def invoke_browser_agent(prompt: str) -> Dict[str, Any]:
-    """
-    Invoke the Browser Agent for web search using agentcore CLI.
-    
-    Args:
-        prompt: Search query or browsing instruction
-        
-    Returns:
-        Response from Browser Agent
-    """
-    try:
-        logger.info(f"Invoking Browser Agent with prompt: {prompt[:100]}...")
-        
-        # Prepare payload
-        payload = {
-            "action": "custom",
-            "prompt": prompt
-        }
-        
-        # Use subprocess to call agentcore CLI
-        import subprocess
-        
-        # Change to Browser Agent directory and invoke
-        browser_agent_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Browser Agent")
-        
-        cmd = [
-            "agentcore", "invoke",
-            json.dumps(payload)
-        ]
-        
-        result = subprocess.run(
-            cmd,
-            cwd=browser_agent_dir,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode == 0:
-            # Parse the output - agentcore returns formatted output
-            output = result.stdout
-            
-            # Try to extract JSON from the output
-            # The response is usually in the "Response:" section
-            if "Response:" in output:
-                response_part = output.split("Response:")[-1].strip()
-                try:
-                    response_json = json.loads(response_part)
-                    return response_json
-                except json.JSONDecodeError:
-                    # If not JSON, return as text
-                    return {
-                        "success": True,
-                        "content": response_part,
-                        "source": "Browser Agent"
-                    }
-            else:
-                return {
-                    "success": True,
-                    "content": output,
-                    "source": "Browser Agent"
-                }
-        else:
-            error_msg = result.stderr or result.stdout
-            logger.error(f"Browser Agent invocation failed: {error_msg}")
-            return {
-                "success": False,
-                "error": error_msg,
-                "message": "Failed to perform web search"
-            }
-            
-    except subprocess.TimeoutExpired:
-        logger.error("Browser Agent invocation timed out")
-        return {
-            "success": False,
-            "error": "Request timed out after 60 seconds",
-            "message": "Web search took too long"
-        }
-    except Exception as e:
-        logger.error(f"Error invoking Browser Agent: {e}", exc_info=True)
-        return {
-            "success": False,
-            "error": str(e),
-            "message": "Failed to perform web search"
-        }
-
-
-def process_web_search(user_input: str):
-    """Process web search request using Browser Agent."""
-    logger.info(f"Processing web search: {user_input[:100]}...")
-    
-    # Add user message to chat
-    user_message = {
-        'role': 'user',
-        'content': user_input,
-        'timestamp': datetime.now().strftime('%H:%M:%S'),
-        'metadata': {'search_type': 'web'}
-    }
-    st.session_state.messages.append(user_message)
-    
-    # Create placeholders
-    response_placeholder = st.empty()
-    progress_placeholder = st.empty()
-    
-    # Track timing
-    start_time = time.time()
-    
-    try:
-        # Show progress
-        with progress_placeholder:
-            st.info("🌐 Searching the web with Browser Agent...")
-        
-        # Invoke Browser Agent
-        result = invoke_browser_agent(user_input)
-        
-        # Calculate latency
-        total_latency = time.time() - start_time
-        
-        # Clear progress
-        progress_placeholder.empty()
-        
-        # Format response based on success
-        if result.get('success'):
-            content = result.get('content', 'No content returned')
-            source = result.get('source', 'Web search')
-            prompt = result.get('prompt', user_input)
-            
-            # Clean up error messages from content if present
-            if 'ActAgentFailed' in content or 'HumanValidationError' in content:
-                # Extract useful info before the error
-                if '\n\n' in content:
-                    content = content.split('\n\n')[0]
-            
-            response_content = f"""**🌐 Web Search Results**
-
-{content}
-
----
-*🔍 Query: {prompt}*  
-*📍 Source: {source}*  
-*⏱️ Search time: {total_latency:.2f}s*
-"""
-        else:
-            error = result.get('error', 'Unknown error')
-            error_type = result.get('error_type', '')
-            
-            # Make error messages more user-friendly
-            if error_type == 'HumanValidationError' or 'HumanValidationError' in error:
-                friendly_error = "🚫 **Website Requires Human Verification**\n\nThe website you're trying to access has CAPTCHA or other human verification that prevents automated access. This is common with news websites that want to prevent automated scraping."
-                suggestions = """**What you can do:**
-- Try a different news source or website
-- Search for the topic on a more accessible site like Wikipedia
-- For Tesla news, try: "What's on Tesla's official blog?" or "Search Tesla on Wikipedia"
-- Specify a particular website known to be accessible: "Get Tesla news from Reuters" or "Find Tesla information on Wikipedia"
-- Try rephrasing to focus on specific aspects: "What are Tesla's recent announcements about electric vehicles?"
-"""
-            elif 'ActAgentFailed' in error:
-                friendly_error = "The browser automation encountered an issue. This can happen with complex websites or when the page structure is unexpected."
-                suggestions = """**Suggestions:**
-- Try rephrasing your query more specifically
-- For URL extraction, specify exactly what information you need
-- Some websites may be difficult to access automatically
-"""
-            elif 'timeout' in error.lower():
-                friendly_error = "The search took too long and timed out. Please try a simpler query."
-                suggestions = """**Suggestions:**
-- Try a more specific query
-- Focus on a single piece of information
-"""
-            else:
-                friendly_error = error
-                suggestions = """**Suggestions:**
-- Try rephrasing your query
-- Check if the website is accessible
-"""
-            
-            response_content = f"""**⚠️ Web Search Issue**
-
-{friendly_error}
-
-{suggestions}
-
-*Search time: {total_latency:.2f}s*
-"""
-        
-        # Update session metrics
-        st.session_state.total_latency += total_latency
-        st.session_state.message_count += 1
-        
-        # Add assistant message
-        assistant_message = {
-            'role': 'assistant',
-            'content': response_content,
-            'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'metadata': {
-                'latency': total_latency,
-                'search_type': 'web',
-                'success': result.get('success', False)
-            }
-        }
-        st.session_state.messages.append(assistant_message)
-        
-        # Display message
-        with response_placeholder:
-            display_message(assistant_message)
-        
-        logger.info(f"Web search completed in {total_latency:.2f}s")
-        
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        logger.error(f"Error in web search: {e}")
-        logger.error(f"Error details: {error_details}")
-        
-        progress_placeholder.empty()
-        
-        error_message = {
-            'role': 'error',
-            'content': f"**Web Search Error**\n\n{str(e)}\n\nPlease try again or contact support.",
-            'metadata': {'error_type': type(e).__name__}
-        }
-        
-        with response_placeholder:
-            display_message(error_message)
-        
-        st.session_state.messages.append(error_message)
+        with st.chat_message("assistant"):
+            st.error(content)
 
 
 def process_user_message(user_input: str):
-    """Process user message and get response from Bedrock agent."""
-    logger.info(f"Processing user message: {user_input[:100]}...")
-    
+    """Process user message and get response from AgentCore Runtime agent."""
+    t0 = time.time()
+    logger.info(f"[TIMING] process_user_message start")
+
     # Add user message to chat
     user_message = {
         'role': 'user',
@@ -683,224 +382,144 @@ def process_user_message(user_input: str):
         'metadata': {}
     }
     st.session_state.messages.append(user_message)
-    logger.info(f"Added user message to history. Total messages: {len(st.session_state.messages)}")
-    
+
     # Create placeholders
     response_placeholder = st.empty()
     progress_placeholder = st.empty()
-    
-    # Track timing and events
+
     start_time = time.time()
     timeline_events = []
-    agent_times = {}
-    last_progress_update = start_time
-    current_progress = ""
-    current_agent_phase = "coordinator"  # Track which agent is likely working
-    
-    # Collect response content
     response_content = ""
-    
+
     try:
-        # Show initial progress
-        current_progress = "🤖 Processing your request..."
         with progress_placeholder:
-            st.info(current_progress)
-        
-        logger.info(f"Invoking Bedrock agent. Session ID: {st.session_state.session_id}, Agent ID: {st.session_state.agent_id}")
-        
-        # Invoke Bedrock agent with streaming
-        response = st.session_state.bedrock_client.invoke_agent(
-            agentId=st.session_state.agent_id,
-            agentAliasId=st.session_state.agent_alias_id,
-            sessionId=st.session_state.session_id,
-            inputText=user_input,
-            enableTrace=True,
-            sessionState={
-                'sessionAttributes': {
-                    'org_id': st.session_state.org_id,
-                    'user_id': st.session_state.user_id
-                }
-            }
+            st.info("Processing your request...")
+
+        t_before_invoke = time.time()
+        logger.info(f"[TIMING] UI setup done: {t_before_invoke - t0:.3f}s — invoking AgentCore now")
+
+        # Invoke AgentCore Runtime
+        response = st.session_state.agentcore_client.invoke_agent_runtime(
+            agentRuntimeArn=st.session_state.agentcore_agent_arn,
+            runtimeSessionId=st.session_state.session_id,
+            contentType="application/json",
+            accept="application/json",
+            payload=json.dumps({
+                "prompt": user_input,
+                "org_id": st.session_state.org_id,
+                "actor_id": st.session_state.user_id,
+                "session_id": st.session_state.session_id,
+                "web_search_enabled": st.session_state.get('web_search_enabled', False),
+                "history": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages[-6:]
+                    if m["role"] in ("user", "assistant") and isinstance(m.get("content"), str)
+                ],
+            }).encode("utf-8"),
         )
-        
-        # Process streaming response
-        event_stream = response['completion']
-        logger.info("Started processing event stream")
-        event_count = 0
-        
-        for event in event_stream:
-            event_count += 1
-            if 'chunk' in event:
-                chunk = event['chunk']
-                if 'bytes' in chunk:
-                    chunk_text = chunk['bytes'].decode('utf-8')
-                    response_content += chunk_text
-                    logger.debug(f"Received chunk: {len(chunk_text)} bytes")
-                    
-                    # Update response display
-                    with response_placeholder.container():
-                        st.markdown(f"""
-                        <div class="chat-message assistant-message">
-                            <div><strong>QueenAI Assistant</strong></div>
-                            <div style="margin-top: 0.5rem;">{response_content}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-            
-            elif 'trace' in event:
-                trace_data = event['trace']
-                if 'trace' in trace_data:
-                    trace = trace_data['trace']
-                    event_time = time.time() - start_time
-                    
-                    # Parse orchestration trace
-                    if 'orchestrationTrace' in trace:
-                        orch_trace = trace['orchestrationTrace']
-                        
-                        # Check for agent collaboration at multiple levels
-                        if 'agentCollaboratorInvocationTrace' in orch_trace:
-                            collab_trace = orch_trace['agentCollaboratorInvocationTrace']
-                            agent_name = collab_trace.get('agentCollaboratorName', collab_trace.get('agentName'))
-                            
-                            if agent_name and agent_name not in agent_times:
-                                agent_times[agent_name] = {'start': event_time}
-                                timeline_events.append({
-                                    'type': 'agent',
-                                    'name': agent_name,
-                                    'time': event_time
-                                })
-                                
-                                # Update agent phase
-                                if 'DataSource' in agent_name:
-                                    current_agent_phase = 'data_source'
-                                elif 'SmartRetrieval' in agent_name or 'Retrieval' in agent_name:
-                                    current_agent_phase = 'retrieval'
-                                elif 'Analysis' in agent_name:
-                                    current_agent_phase = 'analysis'
-                                
-                                # Update progress
-                                with progress_placeholder:
-                                    st.info(f"🤖 {agent_name} is working...")
-                        
-                        # Check model invocation (thinking)
-                        if 'modelInvocationInput' in orch_trace:
-                            # Infer which agent based on phase
-                            agent_name = {
-                                'coordinator': 'Coordinator',
-                                'data_source': 'Data Source Agent',
-                                'retrieval': 'Smart Retrieval Agent',
-                                'analysis': 'Analysis Agent'
-                            }.get(current_agent_phase, 'Agent')
-                            
-                            new_progress = f"🧠 {agent_name} is thinking..."
-                            # Only update if enough time has passed or it's a different message
-                            if new_progress != current_progress and (time.time() - last_progress_update) > 1.0:
-                                current_progress = new_progress
-                                last_progress_update = time.time()
-                                with progress_placeholder:
-                                    st.info(current_progress)
-                        
-                        # Action group invocation (Lambda calls)
-                        if 'invocationInput' in orch_trace:
-                            inv_input = orch_trace['invocationInput']
-                            if 'actionGroupInvocationInput' in inv_input:
-                                action_input = inv_input['actionGroupInvocationInput']
-                                action_group = action_input.get('actionGroupName', 'Unknown')
-                                api_path = action_input.get('apiPath', '')
-                                
-                                # Update agent phase based on Lambda call
-                                if 'GetKpiData' in action_group or 'ExecuteSql' in action_group:
-                                    current_agent_phase = 'retrieval'
-                                
-                                timeline_events.append({
-                                    'type': 'lambda',
-                                    'name': f"{action_group}{api_path}",
-                                    'time': event_time
-                                })
-                                
-                                # Update progress with minimum display time
-                                new_progress = f"📊 Smart Retrieval Agent calling {action_group}..."
-                                if new_progress != current_progress:
-                                    current_progress = new_progress
-                                    last_progress_update = time.time()
-                                    with progress_placeholder:
-                                        st.info(current_progress)
-                                
-                                # After data retrieval, next thinking is likely analysis
-                                if len(timeline_events) > 2:
-                                    current_agent_phase = 'analysis'
-        
+
+        t_after_invoke = time.time()
+        logger.info(f"[TIMING] invoke_agent_runtime returned: {t_after_invoke - t_before_invoke:.3f}s")
+
+        # Read response body — update progress with elapsed time while waiting
+        with progress_placeholder:
+            st.info(f"⏳ Agent thinking... ({t_after_invoke - t_before_invoke:.1f}s to connect, reading response...)")
+
+        stream = response.get("response")
+        if stream is not None:
+            raw = stream.read()
+            response_content = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        else:
+            response_content = ""
+
+        t_after_read = time.time()
+        logger.info(f"[TIMING] stream.read() done: {t_after_read - t_after_invoke:.3f}s — {len(response_content)} chars")
+
         # Clear progress
         progress_placeholder.empty()
-        
-        # Calculate total latency
-        total_latency = time.time() - start_time
-        end_time = time.time()
-        
-        logger.info(f"Completed processing. Events: {event_count}, Latency: {total_latency:.2f}s, Response length: {len(response_content)} chars")
-        
-        # Fetch token usage from CloudWatch (this adds ~1-2s)
-        with st.spinner("📊 Fetching token usage..."):
-            token_usage = fetch_token_usage_from_cloudwatch(
-                st.session_state.session_id,
-                start_time,
-                end_time
-            )
-        
+
+        total_latency = t_after_read - t0
+        logger.info(f"[TIMING] Total end-to-end: {total_latency:.3f}s (UI setup: {t_before_invoke - t0:.3f}s, invoke: {t_after_invoke - t_before_invoke:.3f}s, read: {t_after_read - t_after_invoke:.3f}s)")
+
         # Update session metrics
         st.session_state.total_latency += total_latency
         st.session_state.message_count += 1
-        st.session_state.last_token_usage = token_usage
-        
+
         # Parse JSON response from coordinator
         suggested_questions = []
-        display_content = response_content  # Default to raw content
-        
+        display_content = response_content
+
         try:
-            import re
-            
-            # The Coordinator now returns a JSON response in ```json``` code blocks
-            # Format: ```json\n{"response": "...", "suggested_questions": [...]}\n```
-            
-            json_pattern = r'```json\s*(\{.*?\})\s*```'
-            json_match = re.search(json_pattern, response_content, re.DOTALL)
-            
-            if json_match:
-                json_str = json_match.group(1)
-                try:
-                    response_data = json.loads(json_str)
-                    
-                    # Extract the response text
-                    if 'response' in response_data:
-                        display_content = response_data['response']
-                        logger.info("Extracted response from JSON")
-                    
-                    # Extract suggested questions
-                    if 'suggested_questions' in response_data:
-                        suggested_questions = response_data['suggested_questions']
-                        if isinstance(suggested_questions, list):
-                            logger.info(f"Extracted {len(suggested_questions)} questions from JSON")
-                        else:
-                            logger.warning("suggested_questions is not a list")
-                            suggested_questions = []
-                    
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON response: {e}")
-                    logger.debug(f"JSON string: {json_str[:200]}")
+            stripped = response_content.strip()
+            logger.info(f"[PARSE] Raw response preview: {stripped[:200]}")
+
+            response_data = None
+
+            # Try bare JSON first (most common — agent returns plain JSON)
+            try:
+                response_data = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            # Fallback: extract from ```json ... ``` code fence
+            if response_data is None:
+                import re
+                json_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', stripped)
+                if json_match:
+                    try:
+                        response_data = json.loads(json_match.group(1))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            # Fallback: find first { ... } block
+            if response_data is None:
+                import re
+                json_match = re.search(r'\{[\s\S]*\}', stripped)
+                if json_match:
+                    try:
+                        response_data = json.loads(json_match.group(0))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            if response_data and isinstance(response_data, dict):
+                if 'response' in response_data:
+                    inner = response_data['response']
+                    # Handle double-wrapped: response field contains another ```json...``` or JSON
+                    if isinstance(inner, str):
+                        inner_stripped = inner.strip()
+                        # Try to unwrap nested code fence
+                        import re
+                        fence_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', inner_stripped)
+                        if fence_match:
+                            try:
+                                inner_data = json.loads(fence_match.group(1))
+                                if 'response' in inner_data:
+                                    inner = inner_data['response']
+                                    if 'suggested_questions' in inner_data:
+                                        suggested_questions = inner_data['suggested_questions']
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                        display_content = inner
+                    logger.info("[PARSE] Extracted response field from JSON")
+                if 'suggested_questions' in response_data and not suggested_questions:
+                    sq = response_data['suggested_questions']
+                    if isinstance(sq, list):
+                        suggested_questions = sq
+                # Extract agent-side timing if present
+                agent_timing_raw = response_data.get('_timing', {})
             else:
-                logger.debug("No JSON code block found in response, using raw content")
-            
-            # Update session state with new suggested questions
+                logger.info("[PARSE] No JSON structure found — using raw response")
+                agent_timing_raw = {}
+
             if suggested_questions:
                 st.session_state.suggested_questions = suggested_questions
-            else:
-                logger.debug("No suggested questions found in response")
-                
+
         except Exception as e:
-            logger.warning(f"Failed to parse response: {e}")
-        
-        # Use the extracted display content instead of raw response_content
+            logger.warning(f"[PARSE] Failed to parse response: {e}")
+            agent_timing_raw = {}
+
         response_content = display_content
-        
+
         # Add assistant message to chat
         assistant_message = {
             'role': 'assistant',
@@ -908,88 +527,89 @@ def process_user_message(user_input: str):
             'timestamp': datetime.now().strftime('%H:%M:%S'),
             'metadata': {
                 'latency': total_latency,
+                'timing': {
+                    'invoke_ms': int((t_after_invoke - t_before_invoke) * 1000),
+                    'read_ms': int((t_after_read - t_after_invoke) * 1000),
+                },
+                'agent_timing': agent_timing_raw,
                 'timeline': timeline_events,
                 'suggested_questions': suggested_questions,
-                'token_usage': token_usage
             }
         }
         st.session_state.messages.append(assistant_message)
         logger.info(f"Added assistant message to history. Total messages: {len(st.session_state.messages)}")
-        
-        # Display final message with timeline
+
+        # Invalidate memory cache so sidebar refreshes on next render
+        st.session_state.pop("memory_turns", None)
+
         with response_placeholder:
             display_message(assistant_message)
-        
+
         logger.info("Successfully displayed final message")
-    
+
     except Exception as e:
-        # Handle unexpected errors
         import traceback
         error_details = traceback.format_exc()
         error_str = str(e)
-        
+
         logger.error(f"Error processing message: {error_str}")
         logger.error(f"Error details: {error_details}")
-        
+
         progress_placeholder.empty()
-        
-        # Provide user-friendly error messages
+
         if 'Read timed out' in error_str or 'timeout' in error_str.lower():
             friendly_message = """
-            **Request Timed Out**
-            
-            The request took too long to complete. This can happen with complex queries.
-            
-            **What you can do:**
-            - Try again - it often works on retry
-            - Try a simpler or more specific question
-            - Check if the database is responding slowly
-            """
-        elif 'dependencyFailedException' in error_str or 'service unavailable' in error_str.lower():
+**Request Timed Out**
+
+The request took too long to complete. This can happen with complex queries.
+
+**What you can do:**
+- Try again — it often works on retry
+- Try a simpler or more specific question
+- Check if the AgentCore endpoint is reachable
+"""
+        elif 'service unavailable' in error_str.lower():
             friendly_message = """
-            **Service Temporarily Unavailable**
-            
-            One of the backend agents is experiencing high load. This is typically temporary.
-            
-            **What you can do:**
-            - Wait 30 seconds and try again
-            - Try a simpler question first
-            - Check the sidebar for connection status
-            """
+**Service Temporarily Unavailable**
+
+The AgentCore runtime is experiencing high load. This is typically temporary.
+
+**What you can do:**
+- Wait 30 seconds and try again
+- Try a simpler question first
+- Check the sidebar for connection status
+"""
         elif 'AccessDenied' in error_str or 'accessDeniedException' in error_str:
             friendly_message = """
-            **Permission Error**
-            
-            The agent doesn't have permission to access a required service.
-            
-            **What you can do:**
-            - Contact your administrator
-            - Check IAM role permissions
-            
-            **Technical details:** Agent role needs bedrock:InvokeModel permission.
-            """
+**Permission Error**
+
+The client doesn't have permission to invoke the AgentCore agent.
+
+**What you can do:**
+- Contact your administrator
+- Check IAM role permissions for bedrock-agentcore-runtime
+"""
         elif 'ThrottlingException' in error_str or 'TooManyRequests' in error_str:
             friendly_message = """
-            **Rate Limit Exceeded**
-            
-            Too many requests in a short time.
-            
-            **What you can do:**
-            - Wait a few seconds and try again
-            - The system will automatically retry
-            """
+**Rate Limit Exceeded**
+
+Too many requests in a short time.
+
+**What you can do:**
+- Wait a few seconds and try again
+"""
         else:
             friendly_message = f"""
-            **An Error Occurred**
-            
-            {error_str}
-            
-            **What you can do:**
-            - Try rephrasing your question
-            - Check the connection status in the sidebar
-            - Clear chat and start a new session
-            """
-        
+**An Error Occurred**
+
+{error_str}
+
+**What you can do:**
+- Try rephrasing your question
+- Check the connection status in the sidebar
+- Start a new conversation
+"""
+
         error_message = {
             'role': 'error',
             'content': friendly_message,
@@ -998,15 +618,14 @@ def process_user_message(user_input: str):
                 'error_type': type(e).__name__
             }
         }
-        
+
         with response_placeholder:
             display_message(error_message)
-            
-            # Add retry button for transient errors
+
             if any(x in error_str.lower() for x in ['timeout', 'service unavailable', 'throttling']):
                 if st.button("🔄 Retry Request", key=f"retry_{time.time()}"):
                     st.rerun()
-        
+
         st.session_state.messages.append(error_message)
         logger.info(f"Added error message to history. Error type: {type(e).__name__}")
 
@@ -1014,159 +633,183 @@ def process_user_message(user_input: str):
 def main():
     """Main Streamlit application."""
     logger.info("Starting Streamlit application")
-    
+
     # Initialize session state
     initialize_session_state()
-    
+
     # Header
     st.markdown('<div class="main-header">👑 QueenAI Chat</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">Intelligent Business Data Assistant</div>', unsafe_allow_html=True)
-    
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
-        
-        # Search Mode Selector
-        st.subheader("🔍 Search Mode")
-        search_mode = st.radio(
-            "Choose data source:",
-            options=['internal', 'web'],
-            format_func=lambda x: "📊 Internal Data (Bedrock Agent)" if x == 'internal' else "🌐 Web Search (Browser Agent)",
-            key='search_mode_radio',
-            help="Internal: Query your business data\nWeb: Search the internet for external information"
+
+        # Web search toggle
+        web_search_enabled = st.toggle(
+            "🌐 Web Search",
+            value=st.session_state.get('web_search_enabled', False),
+            help="When ON, the agent can search the web for external information (news, stock prices, market data). When OFF, only internal database tools are used."
         )
-        st.session_state.search_mode = search_mode
-        
-        if search_mode == 'web':
-            st.info("🌐 **Web Search Mode**\n\nUsing Browser Agent with Nova Act to search the web and extract information.")
+        st.session_state.web_search_enabled = web_search_enabled
+        if web_search_enabled:
+            st.caption("Web search active — agent may query external sources.")
         else:
-            st.info("📊 **Internal Data Mode**\n\nUsing Bedrock Agents to query your business data.")
-        
+            st.caption("Internal data only — faster, no external queries.")
+
         st.divider()
-        
-        # Session info
+
+        # Task 7.4 — Session info (no agent_id / agent_alias_id)
         st.subheader("Session Information")
         st.text(f"Session ID: {st.session_state.session_id[:8]}...")
+        st.text(f"User: {st.session_state.user_id}")
+        st.text(f"Chat: #{st.query_params.get('chat', '1')}")
         st.text(f"Org ID: {st.session_state.org_id}")
-        st.text(f"User ID: {st.session_state.user_id}")
-        
+
         # Metrics
         st.subheader("📊 Metrics")
-        
+
         col1, col2 = st.columns(2)
         with col1:
             st.metric("Messages", st.session_state.message_count)
         with col2:
-            avg_latency = (st.session_state.total_latency / st.session_state.message_count 
-                          if st.session_state.message_count > 0 else 0)
+            avg_latency = (
+                st.session_state.total_latency / st.session_state.message_count
+                if st.session_state.message_count > 0 else 0
+            )
             st.metric("Avg Latency", f"{avg_latency:.2f}s")
-        
-        # Stage latencies
+
         if st.session_state.stage_latencies:
             st.subheader("⏱️ Last Query Breakdown")
             for stage, latency in st.session_state.stage_latencies.items():
                 st.text(f"{stage.replace('_', ' ').title()}: {latency:.2f}s")
-        
+
         st.divider()
-        
-        # Dynamic questions: Show follow-ups if available, otherwise show examples
-        if st.session_state.suggested_questions and st.session_state.search_mode == 'internal':
+
+        # Suggested / example questions
+        if st.session_state.suggested_questions:
             st.subheader("💡 Suggested Follow-up Questions")
             st.caption(f"✨ {len(st.session_state.suggested_questions)} AI-suggested questions based on your conversation")
             questions_to_show = st.session_state.suggested_questions
         else:
             st.subheader("💡 Example Questions")
-            if st.session_state.search_mode == 'web':
-                questions_to_show = [
-                    "What's the latest news about Tesla?",
-                    "Get the title from https://www.ctvnews.ca/",
-                    "Search for Amazon's current stock price",
-                    "Find recent news about Microsoft acquisitions",
-                    "What's happening with Apple today?"
-                ]
-            else:
-                questions_to_show = [
-                    "What were the total sales last month?",
-                    "Show me the top 5 stores by revenue",
-                    "What is the average transaction value?",
-                    "Compare sales between Q1 and Q2 in 2023",
-                    "Which products have the highest margin?"
-                ]
-        
+            questions_to_show = [
+                "What were total sales for Q2 2024?",
+                "Show me Kroger revenue by month in 2024",
+                "Compare Q1 vs Q2 2025 sales",
+                "What were Circle K sales in January 2025?",
+                "Which customers had the highest revenue in 2024?"
+            ]
+
         for question in questions_to_show:
             if st.button(question, key=f"question_{hash(question)}", use_container_width=True):
                 st.session_state.user_input = question
                 st.rerun()
-        
+
         st.divider()
-        
-        # Clear chat button
-        if st.button("🗑️ Clear Chat", use_container_width=True):
+
+        # Task 7.4 — "New Conversation" button (renamed from "Clear Chat")
+        if st.button("🗑️ New Conversation", use_container_width=True):
             old_session_id = st.session_state.session_id
             st.session_state.messages = []
-            st.session_state.session_id = str(uuid.uuid4())
+            # Increment chat slot in URL — keeps user identity, starts fresh memory
+            current_slot = int(st.query_params.get("chat", "1"))
+            new_slot = (current_slot % 3) + 1  # cycles 1→2→3→1
+            st.query_params["chat"] = str(new_slot)
+            # session_id will be re-derived on next render from the new URL param
+            del st.session_state["session_id"]
             st.session_state.total_latency = 0
             st.session_state.message_count = 0
             st.session_state.stage_latencies = {}
-            st.session_state.suggested_questions = []  # Clear suggested questions
-            logger.info(f"Chat cleared. Old session: {old_session_id}, New session: {st.session_state.session_id}")
+            st.session_state.suggested_questions = []
+            st.session_state.pop("memory_turns", None)
+            logger.info(f"New conversation. Old: {old_session_id}, slot: {new_slot}")
             st.rerun()
-        
-        # Test connection
+
         if st.button("🔌 Test Connection", use_container_width=True):
-            with st.spinner("Testing connection..."):
+            with st.spinner("Testing AgentCore connection..."):
                 try:
-                    # Test by listing agents
-                    bedrock_agent = boto3.client(
-                        'bedrock-agent',
-                        region_name=os.getenv('AWS_REGION', 'us-west-2')
+                    test_client = boto3.client(
+                        'bedrock-agentcore-control',
+                        region_name=_AWS_REGION,
                     )
-                    bedrock_agent.list_agents(maxResults=1)
-                    st.success(f"✅ Connected to Bedrock\nAgent ID: {st.session_state.agent_id}\nAlias ID: {st.session_state.agent_alias_id}")
+                    test_client.get_agent_runtime(
+                        agentRuntimeId=st.session_state.agentcore_agent_id
+                    )
+                    st.success(f"✅ Connected to AgentCore\nAgent ID: {st.session_state.agentcore_agent_id}")
                 except Exception as e:
-                    st.error(f"❌ Connection failed: {str(e)}")
-    
+                    err = str(e)
+                    if any(x in err for x in ['ResourceNotFoundException', 'AccessDenied']):
+                        st.warning(f"⚠️ Endpoint reachable but agent not found\nAgent ID: {st.session_state.agentcore_agent_id}\n{err}")
+                    else:
+                        st.error(f"❌ Connection failed: {err}")
+
+        st.divider()
+
+        # Memory viewer
+        with st.expander("🧠 AgentCore Memory", expanded=False):
+            st.caption(f"User: {st.session_state.user_id} · Session: {st.session_state.session_id[:8]}...")
+            if st.button("🔄 Refresh Memory", use_container_width=True, key="refresh_memory"):
+                st.session_state.pop("memory_turns", None)
+
+            if "memory_turns" not in st.session_state or st.session_state.get("memory_refresh_session") != st.session_state.session_id:
+                try:
+                    from bedrock_agentcore.memory import MemoryClient as _MemClient
+                    _mc = _MemClient(region_name=_AWS_REGION)
+                    turns = _mc.get_last_k_turns(
+                        memory_id=os.getenv("AGENTCORE_MEMORY_ID", "queen_coordinator_mem-Bjfth3HKgJ"),
+                        actor_id=st.session_state.user_id,
+                        session_id=st.session_state.session_id,
+                        k=10,
+                    )
+                    st.session_state.memory_turns = turns
+                    st.session_state.memory_refresh_session = st.session_state.session_id
+                except Exception as e:
+                    st.session_state.memory_turns = []
+                    st.caption(f"⚠️ {e}")
+
+            turns = st.session_state.get("memory_turns", [])
+            if not turns:
+                st.caption("No memory stored yet for this session.")
+            else:
+                st.caption(f"✅ {len(turns)} turn(s) stored in AgentCore Memory")
+                for i, turn in enumerate(turns):
+                    for msg in turn:
+                        role = msg.get("role", "")
+                        content = msg.get("content", {})
+                        text = content.get("text", "") if isinstance(content, dict) else str(content)
+                        icon = "👤" if role == "USER" else "🤖"
+                        st.markdown(f"**{icon} {role}** _{text[:120]}{'...' if len(text) > 120 else ''}_")
+
     # Main chat area
     chat_container = st.container()
-    
-    # Display chat history
+
     with chat_container:
         if not st.session_state.messages:
-            if st.session_state.search_mode == 'web':
-                st.info("🌐 **Web Search Mode Active**\n\nI can search the web, extract information from URLs, and find real-time data using browser automation.\n\nTry asking about company news, stock prices, or paste a URL to extract information!")
-            else:
-                st.info("📊 **Internal Data Mode Active**\n\nI can help you analyze your business data, KPIs, and transactions.\n\nAsk me about sales, revenue, stores, or any business metrics!")
+            st.info(
+                "📊 **QueenAI Data Assistant**\n\n"
+                "I can help you analyze your business data, KPIs, and transactions. "
+                "Ask me about sales, revenue, stores, or any business metrics!"
+            )
         else:
             for message in st.session_state.messages:
                 display_message(message)
-    
+
     # Chat input
     st.divider()
-    
-    # Check if there's a pre-filled input from example questions
+
     default_input = st.session_state.get('user_input', '')
     if default_input:
         del st.session_state.user_input
-    
-    # Dynamic placeholder based on search mode
-    if st.session_state.search_mode == 'web':
-        placeholder = "Search the web or enter a URL to extract information..."
-    else:
-        placeholder = "Ask a question about your business data..."
-    
-    user_input = st.chat_input(placeholder, key="chat_input")
-    
-    # Process input from either chat_input or example button
+
+    user_input = st.chat_input("Ask a question about your business data...", key="chat_input")
+
     input_to_process = user_input or default_input
-    
+
     if input_to_process:
-        logger.info(f"Processing input in {st.session_state.search_mode} mode: {input_to_process[:50]}...")
+        logger.info(f"Processing input: {input_to_process[:50]}...")
         with chat_container:
-            # Route to appropriate handler based on search mode
-            if st.session_state.search_mode == 'web':
-                process_web_search(input_to_process)
-            else:
-                process_user_message(input_to_process)
+            process_user_message(input_to_process)
         logger.info("Rerunning Streamlit app to display new message")
         st.rerun()
 

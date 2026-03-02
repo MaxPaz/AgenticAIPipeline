@@ -117,95 +117,109 @@ def format_kpis_for_agent(kpis: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return formatted
 
 
+def extract_parameters(event: dict) -> dict:
+    """
+    Extract parameters from either direct JSON or Bedrock action group envelope format.
+
+    Args:
+        event: Lambda event dict
+
+    Returns:
+        Flat dict of parameter name → value
+    """
+    if 'requestBody' in event:
+        # Bedrock action group envelope (backward compatibility)
+        content = event['requestBody']['content']
+        props = content['application/json']['properties']
+        return {p['name']: p['value'] for p in props}
+    # Direct JSON invocation from AgentCore tool dispatcher
+    return event
+
+
 def lambda_handler(event, context):
     """
-    Lambda handler for get_available_kpis action group.
-    
+    Lambda handler for get_available_kpis.
+
+    Accepts both direct JSON invocation (AgentCore) and the legacy
+    Bedrock action group envelope format.
+
     Args:
-        event: Lambda event containing action group parameters
+        event: Lambda event containing parameters
         context: Lambda context
-        
+
     Returns:
-        Action group response with available KPIs
+        Plain JSON dict when called directly; Bedrock action group
+        response envelope when called via action group.
     """
     print(f"Event: {json.dumps(event)}")
-    
+
+    # Detect invocation format before extracting parameters
+    is_action_group = 'requestBody' in event
+
     try:
-        # Extract parameters from event
-        parameters = {}
-        
-        if 'requestBody' in event and 'content' in event['requestBody']:
-            # New Bedrock format
-            content = event['requestBody']['content']
-            if 'application/json' in content and 'properties' in content['application/json']:
-                parameters = {p['name']: p['value'] for p in content['application/json']['properties']}
-        elif 'parameters' in event:
-            # Old format
-            parameters = {p['name']: p['value'] for p in event['parameters']}
-        else:
-            # Fallback
-            parameters = event
-        
+        parameters = extract_parameters(event)
+
         # Get customer parameter
         customer = parameters.get('customer', 'all')
-        
+
         print(f"Parameters: customer={customer}")
-        
+
         # Load all KPIs
         all_kpis = load_kpi_metadata()
         print(f"Loaded {len(all_kpis)} total KPIs")
-        
+
         # Filter by customer
         filtered_kpis = filter_kpis_by_customer(all_kpis, customer)
         print(f"Filtered to {len(filtered_kpis)} KPIs for customer: {customer}")
-        
+
         # Format for agent
         formatted_kpis = format_kpis_for_agent(filtered_kpis)
-        
-        # Prepare response
+
         response_body = {
             'customer': customer,
             'kpi_count': len(formatted_kpis),
             'kpis': formatted_kpis
         }
-        
-        # Return response in Bedrock action group format
-        response = {
-            'messageVersion': '1.0',
-            'response': {
-                'actionGroup': event.get('actionGroup', 'GetAvailableKpisActionGroup'),
-                'apiPath': event.get('apiPath', '/get_available_kpis'),
-                'httpMethod': event.get('httpMethod', 'POST'),
-                'httpStatusCode': 200,
-                'responseBody': {
-                    'application/json': {
-                        'body': json.dumps(response_body, default=str)
+
+        if is_action_group:
+            # Return Bedrock action group response envelope (backward compat)
+            return {
+                'messageVersion': '1.0',
+                'response': {
+                    'actionGroup': event.get('actionGroup', 'GetAvailableKpisActionGroup'),
+                    'apiPath': event.get('apiPath', '/get_available_kpis'),
+                    'httpMethod': event.get('httpMethod', 'POST'),
+                    'httpStatusCode': 200,
+                    'responseBody': {
+                        'application/json': {
+                            'body': json.dumps(response_body, default=str)
+                        }
                     }
                 }
             }
-        }
-        
-        return response
-        
+
+        # Direct JSON invocation — return plain dict
+        return response_body
+
     except Exception as e:
         print(f"Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
-        return {
-            'messageVersion': '1.0',
-            'response': {
-                'actionGroup': event.get('actionGroup', 'GetAvailableKpisActionGroup'),
-                'apiPath': event.get('apiPath', '/get_available_kpis'),
-                'httpMethod': event.get('httpMethod', 'POST'),
-                'httpStatusCode': 500,
-                'responseBody': {
-                    'application/json': {
-                        'body': json.dumps({
-                            'error': str(e),
-                            'kpis': []
-                        })
+
+        if is_action_group:
+            return {
+                'messageVersion': '1.0',
+                'response': {
+                    'actionGroup': event.get('actionGroup', 'GetAvailableKpisActionGroup'),
+                    'apiPath': event.get('apiPath', '/get_available_kpis'),
+                    'httpMethod': event.get('httpMethod', 'POST'),
+                    'httpStatusCode': 500,
+                    'responseBody': {
+                        'application/json': {
+                            'body': json.dumps({'error': str(e), 'kpis': []})
+                        }
                     }
                 }
             }
-        }
+
+        return {'error': str(e), 'kpis': []}

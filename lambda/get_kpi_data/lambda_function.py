@@ -475,47 +475,56 @@ def format_kpi_results(
     return formatted_results
 
 
+def extract_parameters(event: dict) -> dict:
+    """
+    Extract parameters from either direct JSON or Bedrock action group envelope format.
+
+    Args:
+        event: Lambda event dict
+
+    Returns:
+        Flat dict of parameter name → value
+    """
+    if 'requestBody' in event:
+        # Bedrock action group envelope (backward compatibility)
+        content = event['requestBody']['content']
+        props = content['application/json']['properties']
+        return {p['name']: p['value'] for p in props}
+    # Direct JSON invocation from AgentCore tool dispatcher
+    return event
+
+
 def lambda_handler(event, context):
     """
-    Lambda handler for get_kpi_data action group.
-    
+    Lambda handler for get_kpi_data.
+
+    Accepts both direct JSON invocation (AgentCore) and the legacy
+    Bedrock action group envelope format.
+
     Args:
-        event: Lambda event containing action group parameters
+        event: Lambda event containing parameters
         context: Lambda context
-        
+
     Returns:
-        Action group response
+        Plain JSON dict when called directly; Bedrock action group
+        response envelope when called via action group.
     """
     print(f"Event: {json.dumps(event)}")
-    
+
+    # Detect invocation format before extracting parameters
+    is_action_group = 'requestBody' in event
+
     try:
-        # Extract parameters from event
-        # Bedrock action groups pass parameters in different formats
-        parameters = {}
-        
-        if 'requestBody' in event and 'content' in event['requestBody']:
-            # New Bedrock format: requestBody.content.application/json.properties
-            content = event['requestBody']['content']
-            if 'application/json' in content and 'properties' in content['application/json']:
-                parameters = {p['name']: p['value'] for p in content['application/json']['properties']}
-        elif 'parameters' in event:
-            # Old format: parameters array
-            parameters = {p['name']: p['value'] for p in event['parameters']}
-        elif 'actionGroup' in event and 'parameters' in event['actionGroup']:
-            # Alternative format: actionGroup.parameters
-            parameters = {p['name']: p['value'] for p in event['actionGroup']['parameters']}
-        else:
-            # Fallback: treat event as parameters dict
-            parameters = event
-        
+        parameters = extract_parameters(event)
+
         # Get parameters
         kpi_ids_str = parameters.get('kpi_ids', '')
         date_range = parameters.get('date_range', '')
         frequency = parameters.get('frequency', 'monthly')
         org_id = parameters.get('org_id', 'default')
-        
+
         print(f"Parameters: kpi_ids={kpi_ids_str}, date_range={date_range}, frequency={frequency}")
-        
+
         # Parse KPI IDs
         if isinstance(kpi_ids_str, str):
             kpi_ids = [int(x.strip()) for x in kpi_ids_str.split(',') if x.strip()]
@@ -523,57 +532,55 @@ def lambda_handler(event, context):
             kpi_ids = [int(x) for x in kpi_ids_str]
         else:
             kpi_ids = [int(kpi_ids_str)]
-        
+
         if not kpi_ids:
-            return {
-                'messageVersion': '1.0',
-                'response': {
-                    'actionGroup': event.get('actionGroup', 'GetKpiDataActionGroup'),
-                    'apiPath': event.get('apiPath', '/get_kpi_data'),
-                    'httpMethod': event.get('httpMethod', 'POST'),
-                    'httpStatusCode': 400,
-                    'responseBody': {
-                        'application/json': {
-                            'body': json.dumps({
-                                'error': 'No KPI IDs provided',
-                                'kpi_data': []
-                            })
+            error_body = {'error': 'No KPI IDs provided', 'kpi_data': []}
+            if is_action_group:
+                return {
+                    'messageVersion': '1.0',
+                    'response': {
+                        'actionGroup': event.get('actionGroup', 'GetKpiDataActionGroup'),
+                        'apiPath': event.get('apiPath', '/get_kpi_data'),
+                        'httpMethod': event.get('httpMethod', 'POST'),
+                        'httpStatusCode': 400,
+                        'responseBody': {
+                            'application/json': {'body': json.dumps(error_body)}
                         }
                     }
                 }
-            }
-        
+            return error_body
+
         # Parse date range
         start_date, end_date = parse_date_range(date_range)
-        
+
         # Build query with KPI mapping
         query, kpi_info = build_kpi_query(kpi_ids, start_date, end_date, frequency, org_id)
         print(f"Executing query: {query}")
         print(f"KPI Info: {json.dumps(kpi_info, indent=2)}")
-        
+
         # Execute query
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute(query)
         results = cursor.fetchall()
-        
+
         cursor.close()
         conn.close()
-        
+
         # Convert results to list of dicts
         raw_data = [dict(row) for row in results]
-        
+
         print(f"Retrieved {len(raw_data)} rows")
-        
+
         # Validate data quality
         validation = validate_data_quality(raw_data)
         print(f"Data validation: {json.dumps(validation, indent=2)}")
-        
+
         # Format results
         formatted_data = format_kpi_results(raw_data, kpi_info)
-        
-        # Prepare response
+
+        # Prepare response body
         response_body = {
             'kpi_data': formatted_data,
             'count': len(formatted_data),
@@ -583,44 +590,45 @@ def lambda_handler(event, context):
             'frequency': frequency,
             'data_quality': validation
         }
-        
-        # Return response in Bedrock action group format
-        response = {
-            'messageVersion': '1.0',
-            'response': {
-                'actionGroup': event.get('actionGroup', 'GetKpiDataActionGroup'),
-                'apiPath': event.get('apiPath', '/get_kpi_data'),
-                'httpMethod': event.get('httpMethod', 'POST'),
-                'httpStatusCode': 200,
-                'responseBody': {
-                    'application/json': {
-                        'body': json.dumps(response_body, default=str)
+
+        if is_action_group:
+            return {
+                'messageVersion': '1.0',
+                'response': {
+                    'actionGroup': event.get('actionGroup', 'GetKpiDataActionGroup'),
+                    'apiPath': event.get('apiPath', '/get_kpi_data'),
+                    'httpMethod': event.get('httpMethod', 'POST'),
+                    'httpStatusCode': 200,
+                    'responseBody': {
+                        'application/json': {
+                            'body': json.dumps(response_body, default=str)
+                        }
                     }
                 }
             }
-        }
-        
-        return response
-        
+
+        # Direct JSON invocation — return plain dict
+        return response_body
+
     except Exception as e:
         print(f"Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
-        return {
-            'messageVersion': '1.0',
-            'response': {
-                'actionGroup': event.get('actionGroup', 'GetKpiDataActionGroup'),
-                'apiPath': event.get('apiPath', '/get_kpi_data'),
-                'httpMethod': event.get('httpMethod', 'POST'),
-                'httpStatusCode': 500,
-                'responseBody': {
-                    'application/json': {
-                        'body': json.dumps({
-                            'error': str(e),
-                            'kpi_data': []
-                        })
+
+        if is_action_group:
+            return {
+                'messageVersion': '1.0',
+                'response': {
+                    'actionGroup': event.get('actionGroup', 'GetKpiDataActionGroup'),
+                    'apiPath': event.get('apiPath', '/get_kpi_data'),
+                    'httpMethod': event.get('httpMethod', 'POST'),
+                    'httpStatusCode': 500,
+                    'responseBody': {
+                        'application/json': {
+                            'body': json.dumps({'error': str(e), 'kpi_data': []})
+                        }
                     }
                 }
             }
-        }
+
+        return {'error': str(e), 'kpi_data': []}

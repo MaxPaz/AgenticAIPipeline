@@ -1,248 +1,239 @@
 """
-Test script for SQL Executor Lambda function.
-Tests both local execution and deployed Lambda invocation.
+Tests for SQL Executor Lambda function.
+
+Covers:
+- extract_parameters: both direct JSON and Bedrock action group envelope
+- validate_sql_security: forbidden operations, multi-statement, non-SELECT
+- lambda_handler: direct JSON invocation and action group invocation
 """
 
 import json
-import os
-import sys
+import pytest
 
-# Try to import boto3 for deployed testing
-try:
-    import boto3
-    BOTO3_AVAILABLE = True
-except ImportError:
-    BOTO3_AVAILABLE = False
-    print("Warning: boto3 not installed. Deployed Lambda testing will be skipped.")
+from lambda_function import (
+    extract_parameters,
+    validate_sql_security,
+    lambda_handler,
+    FORBIDDEN_OPERATIONS,
+)
 
-# Try to import lambda function (may fail if psycopg2 not installed locally)
-try:
-    from lambda_function import lambda_handler, validate_sql_security
-    LAMBDA_AVAILABLE = True
-except ImportError as e:
-    LAMBDA_AVAILABLE = False
-    print(f"Warning: Cannot import lambda_function ({e}). Local testing will be limited.")
 
-def test_security_validation():
-    """Test SQL security validation logic."""
-    if not LAMBDA_AVAILABLE:
-        print("\n=== Skipping SQL Security Validation (lambda_function not available) ===\n")
-        return True
-    
-    print("\n=== Testing SQL Security Validation ===\n")
-    
-    test_cases = [
-        {
-            "query": "SELECT * FROM users WHERE org_id = 'org_123'",
-            "should_pass": True,
-            "description": "Valid SELECT query"
-        },
-        {
-            "query": "SELECT name, email FROM users WHERE created_at > '2024-01-01'",
-            "should_pass": True,
-            "description": "Valid SELECT with date filter"
-        },
-        {
-            "query": "INSERT INTO users (name) VALUES ('test')",
-            "should_pass": False,
-            "description": "INSERT operation (forbidden)"
-        },
-        {
-            "query": "UPDATE users SET name = 'test' WHERE id = 1",
-            "should_pass": False,
-            "description": "UPDATE operation (forbidden)"
-        },
-        {
-            "query": "DELETE FROM users WHERE id = 1",
-            "should_pass": False,
-            "description": "DELETE operation (forbidden)"
-        },
-        {
-            "query": "DROP TABLE users",
-            "should_pass": False,
-            "description": "DROP operation (forbidden)"
-        },
-        {
-            "query": "SELECT * FROM users; DROP TABLE users;",
-            "should_pass": False,
-            "description": "Multiple statements (SQL injection attempt)"
-        },
-        {
-            "query": "EXEC sp_executesql N'SELECT * FROM users'",
-            "should_pass": False,
-            "description": "EXEC operation (forbidden)"
+# ---------------------------------------------------------------------------
+# extract_parameters
+# ---------------------------------------------------------------------------
+
+class TestExtractParameters:
+    def test_direct_json_returned_as_is(self):
+        payload = {"sql_query": "SELECT 1", "org_id": "org_123"}
+        assert extract_parameters(payload) == payload
+
+    def test_direct_json_empty_dict(self):
+        assert extract_parameters({}) == {}
+
+    def test_bedrock_envelope_extracts_properties(self):
+        event = {
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "properties": [
+                            {"name": "sql_query", "value": "SELECT 1"},
+                            {"name": "org_id", "value": "org_abc"},
+                        ]
+                    }
+                }
+            }
         }
-    ]
-    
-    passed = 0
-    failed = 0
-    
-    for test in test_cases:
-        result = validate_sql_security(test["query"])
-        expected = test["should_pass"]
-        actual = result["valid"]
-        
-        status = "✓ PASS" if actual == expected else "✗ FAIL"
-        
-        print(f"{status}: {test['description']}")
-        print(f"  Query: {test['query'][:60]}...")
-        
-        if actual != expected:
-            print(f"  Expected: {expected}, Got: {actual}")
-            if not result["valid"]:
-                print(f"  Error: {result['error']}")
-            failed += 1
-        else:
-            passed += 1
-        
-        print()
-    
-    print(f"Results: {passed} passed, {failed} failed\n")
-    return failed == 0
+        result = extract_parameters(event)
+        assert result == {"sql_query": "SELECT 1", "org_id": "org_abc"}
 
-
-def test_lambda_local():
-    """Test Lambda function locally (without database connection)."""
-    if not LAMBDA_AVAILABLE:
-        print("\n=== Skipping Local Lambda Handler Tests (lambda_function not available) ===\n")
-        return
-    
-    print("\n=== Testing Lambda Handler Locally ===\n")
-    
-    # Test 1: Missing query parameter
-    print("Test 1: Missing query parameter")
-    event = {"body": json.dumps({"org_id": "org_123"})}
-    response = lambda_handler(event, None)
-    print(f"Status Code: {response['statusCode']}")
-    print(f"Response: {response['body']}\n")
-    
-    # Test 2: Missing org_id parameter
-    print("Test 2: Missing org_id parameter")
-    event = {"body": json.dumps({"query": "SELECT * FROM users"})}
-    response = lambda_handler(event, None)
-    print(f"Status Code: {response['statusCode']}")
-    print(f"Response: {response['body']}\n")
-    
-    # Test 3: Forbidden operation
-    print("Test 3: Forbidden operation (DELETE)")
-    event = {
-        "body": json.dumps({
-            "query": "DELETE FROM users WHERE id = 1",
-            "org_id": "org_123"
-        })
-    }
-    response = lambda_handler(event, None)
-    print(f"Status Code: {response['statusCode']}")
-    print(f"Response: {response['body']}\n")
-    
-    # Test 4: Valid query structure (will fail without DB connection)
-    print("Test 4: Valid query structure (will fail without DB)")
-    event = {
-        "body": json.dumps({
-            "query": "SELECT * FROM users WHERE org_id = 'org_123' LIMIT 10",
-            "org_id": "org_123"
-        })
-    }
-    response = lambda_handler(event, None)
-    print(f"Status Code: {response['statusCode']}")
-    print(f"Response: {response['body']}\n")
-
-
-def test_lambda_deployed(function_name="queen-sql-executor-lambda", region="us-west-2"):
-    """Test deployed Lambda function via AWS API."""
-    if not BOTO3_AVAILABLE:
-        print("\n=== Cannot test deployed Lambda (boto3 not installed) ===\n")
-        print("Install boto3: pip install boto3")
-        return
-    
-    print(f"\n=== Testing Deployed Lambda Function ===\n")
-    print(f"Function: {function_name}")
-    print(f"Region: {region}\n")
-    
-    try:
-        lambda_client = boto3.client('lambda', region_name=region)
-        
-        # Test with a simple valid query
-        test_payload = {
-            "query": "SELECT 1 as test_column",
-            "org_id": "org_test_123"
+    def test_bedrock_envelope_multiple_properties(self):
+        event = {
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "properties": [
+                            {"name": "sql_query", "value": "SELECT * FROM t"},
+                            {"name": "org_id", "value": "org_1"},
+                            {"name": "timeout", "value": "60"},
+                        ]
+                    }
+                }
+            }
         }
-        
-        print(f"Invoking Lambda with payload:")
-        print(json.dumps(test_payload, indent=2))
-        print()
-        
-        response = lambda_client.invoke(
-            FunctionName=function_name,
-            InvocationType='RequestResponse',
-            Payload=json.dumps(test_payload)
+        result = extract_parameters(event)
+        assert result["timeout"] == "60"
+        assert result["sql_query"] == "SELECT * FROM t"
+
+
+# ---------------------------------------------------------------------------
+# validate_sql_security
+# ---------------------------------------------------------------------------
+
+class TestValidateSqlSecurity:
+    def test_valid_select_passes(self):
+        result = validate_sql_security("SELECT * FROM users WHERE org_id = 'x'")
+        assert result["valid"] is True
+
+    def test_select_with_where_and_limit(self):
+        result = validate_sql_security(
+            "SELECT id, name FROM orders WHERE org_id = 'o1' LIMIT 100"
         )
-        
-        # Parse response
-        response_payload = json.loads(response['Payload'].read())
-        
-        print(f"Lambda Response:")
-        print(f"Status Code: {response['StatusCode']}")
-        print(f"Response Payload:")
-        print(json.dumps(response_payload, indent=2))
-        
-        # Check if execution was successful
-        if response['StatusCode'] == 200:
-            body = json.loads(response_payload.get('body', '{}'))
-            if body.get('success'):
-                print("\n✓ Lambda execution successful!")
-                print(f"Rows returned: {body.get('row_count', 0)}")
-                print(f"Execution time: {body.get('execution_time_ms', 0)}ms")
-            else:
-                print(f"\n✗ Lambda execution failed: {body.get('error')}")
-        else:
-            print(f"\n✗ Lambda invocation failed with status {response['StatusCode']}")
-        
-    except lambda_client.exceptions.ResourceNotFoundException:
-        print(f"✗ Lambda function '{function_name}' not found in region '{region}'")
-        print("Make sure the function is deployed first using deploy.sh")
-    except Exception as e:
-        print(f"✗ Error testing deployed Lambda: {str(e)}")
+        assert result["valid"] is True
+
+    @pytest.mark.parametrize("op", FORBIDDEN_OPERATIONS)
+    def test_forbidden_operation_rejected(self, op):
+        query = f"{op} INTO users VALUES (1)"
+        result = validate_sql_security(query)
+        assert result["valid"] is False
+        assert "error" in result
+
+    def test_forbidden_op_case_insensitive(self):
+        result = validate_sql_security("insert into users values (1)")
+        assert result["valid"] is False
+
+    def test_forbidden_op_not_triggered_by_substring(self):
+        # "INSERTED" should not trigger the INSERT rule
+        result = validate_sql_security("SELECT inserted_at FROM logs")
+        assert result["valid"] is True
+
+    def test_multi_statement_rejected(self):
+        result = validate_sql_security("SELECT 1; DROP TABLE users")
+        assert result["valid"] is False
+
+    def test_two_selects_rejected(self):
+        result = validate_sql_security("SELECT 1; SELECT 2")
+        assert result["valid"] is False
+
+    def test_trailing_semicolon_allowed(self):
+        # A single statement with a trailing semicolon is fine
+        result = validate_sql_security("SELECT 1;")
+        assert result["valid"] is True
+
+    def test_non_select_rejected(self):
+        result = validate_sql_security("SHOW TABLES")
+        assert result["valid"] is False
+
+    def test_error_message_does_not_expose_schema(self):
+        result = validate_sql_security("DROP TABLE secret_table")
+        assert "secret_table" not in result.get("error", "")
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("SQL Executor Lambda - Test Suite")
-    print("=" * 60)
-    
-    # Run security validation tests
-    security_passed = test_security_validation()
-    
-    # Run local Lambda handler tests
-    test_lambda_local()
-    
-    # Ask user if they want to test deployed Lambda
-    if LAMBDA_AVAILABLE:
-        print("\nTo test the deployed Lambda function, run:")
-        print("  python test_lambda.py --deployed")
-        print("\nOr test with custom function name and region:")
-        print("  python test_lambda.py --deployed --function-name your-function --region us-east-1")
-    else:
-        print("\nNote: Local testing skipped due to missing dependencies.")
-        print("This is normal - the Lambda will have all dependencies when deployed.")
-    
-    if "--deployed" in sys.argv:
-        function_name = "queen-sql-executor-lambda"
-        region = "us-west-2"
-        
-        # Parse custom function name and region
-        if "--function-name" in sys.argv:
-            idx = sys.argv.index("--function-name")
-            if idx + 1 < len(sys.argv):
-                function_name = sys.argv[idx + 1]
-        
-        if "--region" in sys.argv:
-            idx = sys.argv.index("--region")
-            if idx + 1 < len(sys.argv):
-                region = sys.argv[idx + 1]
-        
-        test_lambda_deployed(function_name, region)
-    
-    print("\n" + "=" * 60)
-    print("Test suite complete!")
-    print("=" * 60)
+# ---------------------------------------------------------------------------
+# lambda_handler — direct JSON invocation
+# ---------------------------------------------------------------------------
+
+class TestLambdaHandlerDirect:
+    """Tests that don't require a real DB connection (validation paths only)."""
+
+    def test_missing_sql_query_returns_error(self):
+        event = {"org_id": "org_1"}
+        response = lambda_handler(event, None)
+        assert response["success"] is False
+        assert "sql_query" in response["error"]
+
+    def test_missing_org_id_returns_error(self):
+        event = {"sql_query": "SELECT 1"}
+        response = lambda_handler(event, None)
+        assert response["success"] is False
+        assert "org_id" in response["error"]
+
+    def test_forbidden_operation_returns_error(self):
+        event = {"sql_query": "DELETE FROM users WHERE id = 1", "org_id": "org_1"}
+        response = lambda_handler(event, None)
+        assert response["success"] is False
+        assert "Forbidden" in response["error"] or "forbidden" in response["error"].lower()
+
+    def test_multi_statement_returns_error(self):
+        event = {"sql_query": "SELECT 1; DROP TABLE users", "org_id": "org_1"}
+        response = lambda_handler(event, None)
+        assert response["success"] is False
+
+    def test_non_select_returns_error(self):
+        event = {"sql_query": "SHOW TABLES", "org_id": "org_1"}
+        response = lambda_handler(event, None)
+        assert response["success"] is False
+
+    def test_direct_response_is_plain_dict(self):
+        """Direct invocation must NOT return a statusCode/body wrapper."""
+        event = {"sql_query": "DELETE FROM t", "org_id": "org_1"}
+        response = lambda_handler(event, None)
+        assert "statusCode" not in response
+        assert "messageVersion" not in response
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler — Bedrock action group invocation
+# ---------------------------------------------------------------------------
+
+class TestLambdaHandlerActionGroup:
+    def _make_event(self, sql_query: str, org_id: str) -> dict:
+        return {
+            "actionGroup": "ExecuteSqlQueryActionGroup",
+            "apiPath": "/execute_sql_query",
+            "httpMethod": "POST",
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "properties": [
+                            {"name": "sql_query", "value": sql_query},
+                            {"name": "org_id", "value": org_id},
+                        ]
+                    }
+                }
+            }
+        }
+
+    def test_action_group_response_has_envelope(self):
+        event = self._make_event("DELETE FROM t", "org_1")
+        response = lambda_handler(event, None)
+        assert "messageVersion" in response
+        assert "response" in response
+
+    def test_action_group_forbidden_op_returns_403(self):
+        event = self._make_event("DROP TABLE users", "org_1")
+        response = lambda_handler(event, None)
+        assert response["response"]["httpStatusCode"] == 403
+
+    def test_action_group_missing_query_returns_400(self):
+        event = {
+            "actionGroup": "ExecuteSqlQueryActionGroup",
+            "apiPath": "/execute_sql_query",
+            "httpMethod": "POST",
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "properties": [
+                            {"name": "org_id", "value": "org_1"},
+                        ]
+                    }
+                }
+            }
+        }
+        response = lambda_handler(event, None)
+        assert response["response"]["httpStatusCode"] == 400
+
+    def test_action_group_missing_org_id_returns_400(self):
+        event = {
+            "actionGroup": "ExecuteSqlQueryActionGroup",
+            "apiPath": "/execute_sql_query",
+            "httpMethod": "POST",
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "properties": [
+                            {"name": "sql_query", "value": "SELECT 1"},
+                        ]
+                    }
+                }
+            }
+        }
+        response = lambda_handler(event, None)
+        assert response["response"]["httpStatusCode"] == 400
+
+    def test_action_group_body_is_json_string(self):
+        event = self._make_event("INSERT INTO t VALUES (1)", "org_1")
+        response = lambda_handler(event, None)
+        body_str = response["response"]["responseBody"]["application/json"]["body"]
+        body = json.loads(body_str)
+        assert "success" in body
+        assert body["success"] is False

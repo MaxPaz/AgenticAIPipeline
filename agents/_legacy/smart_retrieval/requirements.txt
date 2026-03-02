@@ -1,0 +1,5 @@
+# Smart Retrieval Agent Requirements
+# This agent autonomously retrieves data from KPIs and/or transactional database
+
+boto3>=1.34.0
+botocore>=1.34.0

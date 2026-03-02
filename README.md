@@ -1,323 +1,132 @@
 # QueenAI Agentic Chat Pipeline
 
-An advanced multi-agent system for intelligent business data querying using AWS Bedrock Agents. This system provides a conversational interface for analyzing business KPIs and transactional data with AI-powered insights and dynamic follow-up questions.
-
-## What is This Project?
-
-The QueenAI Agentic Chat Pipeline is an **autonomous AI system** that enables natural language querying of business data. Instead of writing SQL queries or navigating complex dashboards, users can simply ask questions like "What were the total sales last month?" or "Show me the top 5 customers by revenue" and receive intelligent, contextual responses.
-
-### How It Works
-
-The system uses **four specialized AI agents** orchestrated by AWS Bedrock that work together autonomously:
-
-1. **Coordinator Agent**: Receives your question and orchestrates the entire workflow
-2. **Data Source Agent**: Analyzes your question to determine the best data source (KPIs vs. raw transactions)
-3. **Smart Retrieval Agent**: Autonomously fetches the data by calling Lambda functions that query your database
-4. **Analysis Agent**: Interprets the results, generates business insights, and suggests relevant follow-up questions
-
-All of this happens automatically - the agents communicate with each other through AWS Bedrock's Agent Collaboration feature, with no custom orchestration code required.
-
-### Key Innovation
-
-Unlike traditional chatbots that require manual integration code, this system leverages **AWS Bedrock's native agent collaboration** to create a fully autonomous pipeline. The agents make their own decisions about:
-- Which data sources to query
-- Whether to use pre-calculated KPIs or run custom SQL queries
-- How to interpret and present the results
-- What follow-up questions would be most valuable
+A conversational AI system for natural language querying of business KPI and transactional data, built on **AWS Bedrock AgentCore** with the **Strands Agents SDK**.
 
 ## Architecture
 
-![Architecture Diagram](architecture_diagram.png)
+![Architecture Diagram](agentcore_architecture_diagram.png)
 
-### Agent Workflow
+One AgentCore runtime hosts three Strands agents running in-process:
 
 ```
-User Query → Coordinator Agent
-              ↓
-         Data Source Agent (determines data source)
-              ↓
-         Smart Retrieval Agent (fetches data via KPIs or SQL)
-              ↓
-         Analysis Agent (generates insights + suggested questions)
-              ↓
-         Coordinator Agent (formats response)
-              ↓
-         User (receives answer + follow-up suggestions)
+User → Streamlit UI
+  → invoke_agent_runtime → AgentCore Runtime (queen_coordinator)
+      Coordinator Agent (Haiku 4.5) — routing, context, conversation
+        → data_specialist tool → Data Specialist Agent (Sonnet 4.5)
+            → get_kpi_data Lambda → MySQL RDS
+            → execute_sql_query Lambda → MySQL RDS
+        → analysis tool → Analysis Agent (Haiku 4.5)
+        → web_search tool → Nova 2 Lite (nova_grounding)
+        → get_available_kpis tool → Lambda
+  ← JSON response: { response, suggested_questions }
 ```
 
-### Components
-
-- **Coordinator Agent**: Orchestrates the entire workflow and manages context
-- **Data Source Agent**: Analyzes questions to determine optimal data source
-- **Smart Retrieval Agent**: Autonomously retrieves data from KPIs or database
-- **Analysis Agent**: Interprets results and generates business insights
-- **Browser Agent** (Optional): Performs web searches using AWS Nova Act
-
-## Features
-
-- 🤖 **Multi-Agent Architecture**: Four specialized agents working together autonomously via AWS Bedrock
-- 💬 **Conversational UI**: Streamlit-based chat interface with real-time streaming responses
-- 📊 **Intelligent Data Retrieval**: Automatically determines whether to use KPIs or SQL queries
-- 🔍 **Web Search Integration**: Optional Browser Agent for external information retrieval using AWS Nova Act
-- 💡 **Dynamic Follow-up Questions**: AI-generated contextual questions based on your conversation
-- 📈 **Token Usage Tracking**: Real-time visibility into LLM token consumption via CloudWatch
-- 🎯 **Context-Aware Memory**: Maintains conversation history for natural follow-up queries
-- 🔒 **Security First**: SQL injection prevention, read-only queries, and org-level data isolation
-- ⚡ **Performance Optimized**: Prompt caching, direct responses, and efficient agent routing
-- 📊 **Workflow Visibility**: See exactly which agents were invoked and what data was retrieved
-
-## Use Cases
-
-### Business Analytics
-- "What were our total sales last quarter?"
-- "Show me the top 10 customers by revenue"
-- "Compare Q1 2024 vs Q1 2023 performance"
-- "Which products have the highest profit margins?"
-
-### Operational Insights
-- "How many orders did we process yesterday?"
-- "What's the average transaction value for Store X?"
-- "Show me sales trends for the last 6 months"
-- "Which stores are underperforming this month?"
-
-### Conversational Follow-ups
-- Initial: "What were Circle K sales in January?"
-- Follow-up: "What about February?" (remembers Circle K)
-- Follow-up: "Show me the same for Kroger" (applies pattern to new entity)
-- Follow-up: "How does that compare to last year?" (maintains full context)
-
-### Web Research (Optional)
-- "What's the latest news about Tesla?"
-- "Find Amazon's current stock price"
-- "Get information from this URL: https://example.com"
-
-## Why This Project is Special
-
-### 1. **True Autonomous Agents**
-Unlike traditional chatbots that follow hardcoded logic, these agents make real decisions:
-- The Smart Retrieval Agent decides whether to query KPIs, run SQL, or both
-- The Analysis Agent determines what insights are relevant
-- The Coordinator manages conversation flow dynamically
-
-### 2. **No Custom Orchestration Code**
-The entire agent workflow is configured in AWS Bedrock Console using native Agent Collaboration. There's no Python code managing agent handoffs - it's all declarative configuration.
-
-### 3. **Conversation Memory**
-The system maintains context across multiple turns:
-- Remembers entities mentioned earlier ("Show me the same for Kroger")
-- Resolves pronouns ("How does that compare to last month?")
-- Applies query patterns to new contexts
-- Isolates memory between different sessions
-
-### 4. **Production-Ready**
-Built with enterprise requirements in mind:
-- Comprehensive error handling and retry logic
-- SQL injection prevention and query validation
-- Multi-tenant data isolation (org_id filtering)
-- CloudWatch logging and monitoring
-- Token usage tracking for cost management
-
-### 5. **Extensible Architecture**
-Easy to add new capabilities:
-- Add new data sources by creating Lambda functions
-- Integrate external APIs through action groups
-- Add specialized agents for domain-specific tasks
-- Extend with web search using Browser Agent
+No network hops between agents — all three run in the same container. This replaces the old 4-agent Bedrock Agents setup that took 40–60 seconds per query.
 
 ## Project Structure
 
 ```
 .
-├── agents/                    # Agent implementations and instructions
-│   ├── coordinator_instructions.txt
-│   ├── analysis/
-│   ├── data_source/
-│   └── smart_retrieval/
-├── lambda/                    # AWS Lambda functions
-│   ├── get_available_kpis/   # KPI metadata retrieval
-│   ├── get_kpi_data/         # KPI data retrieval
-│   └── sql_executor/         # SQL query execution
-├── infrastructure/            # AWS CDK infrastructure code
+├── agents/
+│   ├── coordinator/        # Coordinator Agent (entry point)
+│   │   ├── entrypoint.py   # AgentCore app — deployed to AWS
+│   │   ├── agent.py        # Strands Agent definition
+│   │   ├── prompts.py      # System prompt
+│   │   └── web_search.py   # Nova 2 Lite web search
+│   ├── specialist/         # Data Specialist Agent
+│   │   ├── agent.py
+│   │   └── prompts.py
+│   ├── analysis/           # Analysis Agent
+│   │   ├── agent.py
+│   │   └── prompts.py
+│   └── _legacy/            # Old Bedrock Agents code (reference only)
+├── lambda/
+│   ├── get_available_kpis/ # Returns KPI metadata for a customer
+│   ├── get_kpi_data/       # Retrieves KPI data from MySQL
+│   └── sql_executor/       # Executes SELECT queries against MySQL
+├── infrastructure/
 │   └── cdk/
-├── ui/                       # Streamlit user interface
-│   └── app.py               # Main chat interface
-├── Browser Agent/            # Web search integration (optional)
-├── config/                   # Configuration utilities
-├── tools/                    # Metadata loader tools
-├── database/                 # Database setup scripts
-├── requirements.txt          # Python dependencies
-├── .env.example             # Environment template
-└── architecture_diagram.png  # System architecture diagram
+│       └── bedrock_agent_stack.py  # CDK stack (Lambda + AgentCore IAM)
+├── ui/
+│   └── app.py              # Streamlit chat interface
+├── Browser Agent/          # Separate browser automation agent (legacy)
+├── entrypoint.py           # Root-level stub (AgentCore uses agents/coordinator/entrypoint.py)
+├── .bedrock_agentcore.yaml # AgentCore CLI config
+└── .env.example            # Environment variable template
 ```
-
-## Prerequisites
-
-- Python 3.9+
-- AWS Account with Bedrock access
-- AWS CLI configured
-- Node.js and AWS CDK (for infrastructure deployment)
-- MySQL/PostgreSQL database (for transactional data)
 
 ## Quick Start
 
-### 1. Clone and Setup
+### Prerequisites
+- Python 3.10+
+- AWS account with Bedrock access (us-west-2)
+- AWS CLI configured (`aws configure`)
+- Virtual environment: `source venv/bin/activate`
+
+### Run the UI
 
 ```bash
-git clone <repository-url>
-cd AWS_chat
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 2. Configure Environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and configure:
-- `AWS_REGION`: Your AWS region (e.g., us-west-2)
-- `BEDROCK_AGENT_ID`: Your Bedrock Coordinator Agent ID
-- `BEDROCK_AGENT_ALIAS_ID`: Your Bedrock Agent Alias ID
-- Database connection details (if using transactional data)
-
-### 3. Deploy Infrastructure
-
-See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for detailed deployment instructions.
-
-```bash
-cd infrastructure/cdk
-cdk deploy
-```
-
-### 4. Launch UI
-
-```bash
+source venv/bin/activate
 streamlit run ui/app.py
 ```
 
-The UI will be available at `http://localhost:8501`
+Requires `.env` with:
+```
+AGENTCORE_AGENT_ID=queen_coordinator-agAC6uDNBA
+AWS_REGION=us-west-2
+```
 
-## Configuration
-
-### Required Environment Variables
+### Redeploy the Agent
 
 ```bash
-# AWS Configuration
+source venv/bin/activate
+agentcore launch --auto-update-on-conflict
+```
+
+### Run Tests
+
+```bash
+# Agent unit tests
+python3 -m pytest agents/specialist/test_specialist.py agents/coordinator/test_coordinator.py -v
+
+# Lambda tests (run per-directory due to name collision)
+python3 -m pytest lambda/get_available_kpis/test_lambda.py -v
+python3 -m pytest lambda/get_kpi_data/test_lambda.py -v
+python3 -m pytest lambda/sql_executor/test_lambda.py -v
+```
+
+## Environment Variables
+
+```bash
+# Required
+AGENTCORE_AGENT_ID=queen_coordinator-agAC6uDNBA
 AWS_REGION=us-west-2
 
-# Bedrock Agent Configuration
-BEDROCK_AGENT_ID=your_agent_id
-BEDROCK_AGENT_ALIAS_ID=your_alias_id
-
-# Database Configuration (optional)
-DB_HOST=your_db_host
+# Database (for Lambda functions)
+DB_HOST=...
 DB_PORT=3306
-DB_NAME=your_db_name
-DB_USER=your_db_user
-DB_PASSWORD=your_db_password
+DB_NAME=...
+DB_USER=...
+DB_PASSWORD=...
 ```
 
-### Optional Features
+## Deployed Resources
 
-**Web Search (Browser Agent)**:
-- Set `BROWSER_AGENT_ARN` in `.env`
-- See `Browser Agent/README.md` for setup instructions
+| Resource | ID / Name |
+|---|---|
+| AgentCore Runtime | `queen_coordinator-agAC6uDNBA` |
+| Lambda: get_available_kpis | `queen-get-available-kpis-lambda` |
+| Lambda: get_kpi_data | `queen-get-kpi-data-lambda` |
+| Lambda: sql_executor | `queen-sql-executor-lambda` |
+| CloudWatch Logs | `/aws/bedrock-agentcore/runtimes/queen_coordinator-agAC6uDNBA-DEFAULT` |
 
-## Usage
+## Example Queries
 
-### Example Queries
+- "What were Customer A's total sales in Q4 2024?"
+- "Show me out-of-stock rates for all customers this month"
+- "Compare January 2025 revenue to January 2024"
+- "What's the latest news about Reddy Ice?"
 
-```
-"What were the total sales last month?"
-"Compare revenue between Q1 and Q2 in 2023"
-"Show me the top 5 customers by revenue"
-"What were the monthly trends for Customer A?"
-```
+## Legacy
 
-### Features
-
-1. **Dynamic Follow-up Questions**: After each response, the system suggests relevant follow-up questions
-2. **Token Usage Tracking**: View token consumption for each query in the workflow expander
-3. **Web Search Mode**: Toggle between internal data and web search
-4. **Session Management**: Conversations maintain context across multiple queries
-
-## Development
-
-### Running Tests
-
-#### Lambda Function Tests
-Test individual Lambda functions:
-
-```bash
-# Test SQL executor
-python lambda/sql_executor/test_lambda.py
-
-# Test deployed Lambda
-python lambda/sql_executor/test_lambda.py --deployed
-```
-
-### Deploying Agent Updates
-
-```bash
-# Deploy coordinator
-cd agents
-./deploy_coordinator.sh
-
-# Deploy individual agents
-cd agents/analysis
-./deploy.sh
-```
-
-### Viewing Logs
-
-CloudWatch logs are available at:
-- Log Group: `BedrockLogging`
-- Contains model invocations and token usage
-- Query example:
-  ```bash
-  aws logs tail BedrockLogging --since 20m --region us-west-2 --format short
-  ```
-
-## Architecture Details
-
-For detailed architecture information, see [BEDROCK_AGENT_ARCHITECTURE.md](BEDROCK_AGENT_ARCHITECTURE.md)
-
-### Key Design Decisions
-
-- **JSON Response Format**: Coordinator returns structured JSON for reliable parsing
-- **Context Summarization**: Prevents token explosion in long conversations
-- **Autonomous Retrieval**: Smart Retrieval Agent decides between KPIs and SQL
-- **Token Tracking**: CloudWatch integration for cost visibility
-
-## Troubleshooting
-
-### Common Issues
-
-**"Agent not found" error**:
-- Verify `BEDROCK_AGENT_ID` and `BEDROCK_AGENT_ALIAS_ID` in `.env`
-- Ensure agent alias points to the latest version
-
-**Token usage shows 0**:
-- CloudWatch logs may have a delay (wait 30-60 seconds)
-- Verify CloudWatch logging is enabled for Bedrock
-
-**Suggested questions not appearing**:
-- Ensure coordinator agent is using the latest instructions
-- Check that agent alias is updated after deployment
-
-## Contributing
-
-1. Create a feature branch
-2. Make your changes
-3. Test thoroughly
-4. Submit a pull request
-
-## License
-
-Proprietary - QueenAI
-
-## Support
-
-For issues or questions, please contact the development team.
+The original 4-agent Bedrock Agents implementation (40–60s latency) is preserved in `agents/_legacy/` for reference. The CDK stack previously deployed those agents; the updated stack in `infrastructure/cdk/bedrock_agent_stack.py` provisions only the Lambda functions and AgentCore IAM role.

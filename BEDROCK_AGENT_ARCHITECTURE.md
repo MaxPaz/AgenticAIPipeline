@@ -1,245 +1,141 @@
-# QueenAI Agentic Chat Pipeline - Bedrock Agent Architecture
+# QueenAI — AgentCore Architecture
 
 ## Overview
 
-This project implements a **4-agent architecture** using **AWS Bedrock Agents** for autonomous data retrieval and analysis. The agents are configured and orchestrated entirely within AWS Bedrock - **no Python orchestration code is used**.
+The system uses **AWS Bedrock AgentCore** with the **Strands Agents SDK** to host three in-process agents as a single managed runtime. This replaced the original 4-agent Bedrock Agents setup which had 40–60 second response times due to inter-agent network overhead.
 
-## Architecture Diagram
+## Architecture
+
+![AgentCore Architecture](agentcore_architecture_diagram.png)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Streamlit UI                              │
-│                     (ui/app.py)                                  │
+│                    Streamlit UI (ui/app.py)                      │
+│  boto3 bedrock-agentcore client → invoke_agent_runtime()         │
 └────────────────────────┬────────────────────────────────────────┘
                          │
-                         │ bedrock_client.invoke_agent()
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   Bedrock Coordinator Agent                      │
-│                  (Configured in Bedrock Console)                 │
+│         AgentCore Runtime: queen_coordinator-agAC6uDNBA          │
+│         Region: us-west-2  |  ARM64 container via CodeBuild      │
 │                                                                   │
-│  - Orchestrates workflow                                         │
-│  - Manages conversation context                                  │
-│  - Routes to specialized agents                                  │
-└──────┬──────────────────┬──────────────────┬────────────────────┘
-       │                  │                  │
-       ▼                  ▼                  ▼
-┌─────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│ Data Source │  │ Smart Retrieval  │  │ Analysis Agent   │
-│   Agent     │  │     Agent        │  │                  │
-│             │  │                  │  │                  │
-│ Determines  │  │ Retrieves data   │  │ Generates        │
-│ available   │  │ autonomously     │  │ insights         │
-│ data sources│  │                  │  │                  │
-└─────────────┘  └────────┬─────────┘  └──────────────────┘
-                          │
-                          │ Calls Lambda Functions
-                          ▼
-                 ┌─────────────────────┐
-                 │  Lambda Functions   │
-                 │                     │
-                 │  - get_kpi_data     │
-                 │  - execute_sql_query│
-                 └──────────┬──────────┘
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Coordinator Agent  (Haiku 4.5)                          │   │
+│  │  agents/coordinator/entrypoint.py                        │   │
+│  │                                                          │   │
+│  │  Tools:                                                  │   │
+│  │  • get_available_kpis → Lambda                           │   │
+│  │  • web_search → Nova 2 Lite (nova_grounding)             │   │
+│  │  • data_specialist → Data Specialist Agent (in-process)  │   │
+│  │  • analysis → Analysis Agent (in-process)                │   │
+│  └──────────────┬───────────────────────┬───────────────────┘   │
+│                 │                       │                         │
+│                 ▼                       ▼                         │
+│  ┌──────────────────────┐  ┌──────────────────────────────────┐ │
+│  │  Data Specialist     │  │  Analysis Agent (Haiku 4.5)      │ │
+│  │  Agent (Sonnet 4.5)  │  │  Pure formatting — no tools      │ │
+│  │                      │  │  Returns JSON:                   │ │
+│  │  Tools:              │  │  { response, suggested_questions }│ │
+│  │  • get_kpi_data      │  └──────────────────────────────────┘ │
+│  │  • execute_sql_query │                                        │
+│  └──────────┬───────────┘                                        │
+└─────────────┼──────────────────────────────────────────────────-─┘
+              │ boto3 lambda.invoke (direct JSON payload)
+              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    AWS Lambda Functions                          │
+│  queen-get-available-kpis-lambda                                 │
+│  queen-get-kpi-data-lambda                                       │
+│  queen-sql-executor-lambda                                       │
+└───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
-                   ┌─────────────────┐
-                   │  MySQL RDS      │
-                   │  Database       │
-                   └─────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    MySQL RDS Database                            │
+│  reddyice_s3_commercial_money  — chain-level KPI aggregates      │
+│  reddyice_s3_order_details     — individual order records        │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Components
+## Components
 
-### 1. Streamlit UI (`ui/app.py`)
-- **Purpose**: User interface for chat interactions
-- **Key Function**: Calls `bedrock_client.invoke_agent()` directly
-- **No Python Orchestration**: All agent coordination happens in Bedrock
+### AgentCore Runtime
+- **Deployed via**: `agentcore launch` (Strands starter toolkit)
+- **Container**: ARM64, built by CodeBuild, stored in ECR
+- **Entry point**: `agents/coordinator/entrypoint.py`
+- **Agent ID**: `queen_coordinator-agAC6uDNBA`
+- **Logs**: `/aws/bedrock-agentcore/runtimes/queen_coordinator-agAC6uDNBA-DEFAULT`
 
-### 2. Bedrock Coordinator Agent
-- **Configured In**: AWS Bedrock Console
-- **Model**: Claude 3.7 Sonnet
-- **Responsibilities**:
-  - Receives user questions
-  - Manages conversation context
-  - Routes to specialized agents via Agent Collaboration
-  - Returns final response to user
+### Coordinator Agent
+- **Model**: `us.anthropic.claude-haiku-4-5-20251001-v1:0` (cross-region inference profile)
+- **Role**: Routes questions, resolves conversation context, calls tools
+- **File**: `agents/coordinator/agent.py` + `agents/coordinator/prompts.py`
 
-### 3. Bedrock Data Source Agent
-- **Configured In**: AWS Bedrock Console
-- **Model**: Claude 3.7 Sonnet
-- **Responsibilities**:
-  - Analyzes user questions
-  - Determines available data sources (KPIs vs transactional)
-  - Returns data source recommendations
+### Data Specialist Agent
+- **Model**: `us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+- **Role**: KPI planning, SQL generation, data retrieval, retry logic (max 3 attempts)
+- **File**: `agents/specialist/agent.py` + `agents/specialist/prompts.py`
+- **Invoked as**: a tool by the Coordinator (in-process, no network hop)
 
-### 4. Bedrock Smart Retrieval Agent
-- **Configured In**: AWS Bedrock Console
-- **Model**: Claude 3.7 Sonnet
-- **Action Groups**:
-  - `get_kpi_data` → Lambda function
-  - `execute_sql_query` → Lambda function
-- **Responsibilities**:
-  - Autonomously retrieves data
-  - Decides whether to use KPIs, SQL, or both
-  - Handles retries and error recovery
+### Analysis Agent
+- **Model**: `us.anthropic.claude-haiku-4-5-20251001-v1:0`
+- **Role**: Formats raw data into markdown response with insights and follow-up questions
+- **File**: `agents/analysis/agent.py` + `agents/analysis/prompts.py`
+- **No tools** — pure text-in, text-out
 
-### 5. Bedrock Analysis Agent
-- **Configured In**: AWS Bedrock Console
-- **Model**: Claude 3.7 Sonnet (recommend switching to Haiku)
-- **Responsibilities**:
-  - Interprets query results
-  - Generates business insights
-  - Formats data (currency, percentages, dates)
-  - Creates markdown tables
-  - Suggests follow-up questions
+### Web Search
+- **Implementation**: `agents/coordinator/web_search.py`
+- **Model**: `us.amazon.nova-2-lite-v1:0` with `nova_grounding` system tool
+- **Replaces**: Old Nova Act browser automation (was 60s, now 1–2s)
 
-### 6. Lambda Functions
-- **get_kpi_data**: Retrieves pre-calculated KPI data from MySQL
-- **execute_sql_query**: Executes SQL queries against MySQL with security validation
+### Lambda Functions
+All three accept both direct JSON payloads (AgentCore) and legacy Bedrock action group envelope format (backward compatible).
 
-### 7. MySQL RDS Database
-- **Tables**:
-  - `reddyice_s3_commercial_money`: Pre-calculated KPI data
-  - `reddyice_s3_order_details`: Transactional order data
+| Function | Purpose |
+|---|---|
+| `queen-get-available-kpis-lambda` | Returns KPI IDs and definitions for a customer |
+| `queen-get-kpi-data-lambda` | Retrieves pre-calculated KPI data from MySQL |
+| `queen-sql-executor-lambda` | Executes SELECT queries with security validation |
 
-## Important Notes
+### Security
+- SQL validation: SELECT-only, no forbidden ops, no multi-statement, org_id required
+- AgentCore IAM role: `lambda:InvokeFunction` scoped to the three Lambda ARNs only
+- Tenant isolation: `org_id` passed through all data queries
 
-### ⚠️ No Python Orchestration
-- The Python files in `agents/` directory (e.g., `data_source_agent.py`, `analysis_agent.py`) are **NOT used** in the actual execution
-- They exist only as **reference implementations** and **documentation**
-- **All orchestration happens in Bedrock Console** via Agent Collaboration
+## Performance
 
-## How to Implement This in Your AWS Account
+| Metric | Old (Bedrock Agents) | New (AgentCore) |
+|---|---|---|
+| Simple KPI query | 40–60s | ~3–5s |
+| SQL query | 40–60s | ~5–8s |
+| Web search | 60s (Nova Act) | 1–2s (Nova Lite) |
+| Agent hops | 4 (network) | 3 (in-process) |
+| Model | Sonnet 3.7 only | Haiku 4.5 + Sonnet 4.5 |
 
-### Step 1: Create Lambda Functions
-1. Deploy `lambda/get_kpi_data/` to AWS Lambda
-2. Deploy `lambda/sql_executor/` to AWS Lambda
-3. Configure environment variables (DB_HOST, DB_USER, etc.)
-4. Attach IAM roles with RDS access
+## Deployment
 
-### Step 2: Create Bedrock Agents
-
-#### Coordinator Agent:
-```
-Name: QueenAI-Coordinator-Agent
-Model: Claude 3.7 Sonnet
-Instructions: [Copy from agents/coordinator_agent.py docstring]
-Agent Collaboration: Enable
-  - DataSourceAgent
-  - SmartRetrievalAgent
-  - AnalysisAgent
-```
-
-#### Data Source Agent:
-```
-Name: QueenAI-DataSource-Agent
-Model: Claude 3.7 Sonnet
-Instructions: [Copy from agents/data_source/data_source_agent.py docstring]
-```
-
-#### Smart Retrieval Agent:
-```
-Name: QueenAI-SmartRetrieval-Agent
-Model: Claude 3.7 Sonnet
-Instructions: [Copy from agents/smart_retrieval/smart_retrieval_agent.py docstring]
-Action Groups:
-  - GetKpiDataActionGroup → Lambda: get_kpi_data
-  - ExecuteSqlQueryActionGroup → Lambda: execute_sql_query
-```
-
-#### Analysis Agent:
-```
-Name: QueenAI-Analysis-Agent
-Model: Claude 3.5 Haiku (recommended for performance)
-Instructions: [Copy from agents/analysis/analysis_agent.py docstring]
-Return to User: Yes (for direct response optimization)
-```
-
-### Step 3: Configure Agent Collaboration
-
-In Coordinator Agent:
-1. Add "Agent Collaboration" associations
-2. Link to DataSourceAgent, SmartRetrievalAgent, AnalysisAgent
-3. Configure collaboration prompts
-
-### Step 4: Deploy Streamlit UI
-1. Update `ui/app.py` with your Bedrock Agent IDs
-2. Set environment variables:
-   ```
-   BEDROCK_AGENT_ID=<your-coordinator-agent-id>
-   BEDROCK_AGENT_ALIAS_ID=<your-agent-alias-id>
-   AWS_REGION=us-west-2
-   ```
-3. Deploy to your hosting platform
-
-### Step 5: Test End-to-End
-1. Open Streamlit UI
-2. Ask: "What were Customer A sales in 2023?"
-3. Verify agents are invoked in correct order
-4. Check CloudWatch logs for latency metrics
-
-## Performance Optimization
-
-See `OPTIMIZATION_RECOMMENDATIONS.md` for detailed performance tuning guidance.
-
-**Key Optimizations:**
-1. Switch Analysis Agent to Claude 3.5 Haiku (3-5x faster)
-2. Enable direct response from Analysis Agent (saves 15-17s)
-3. Enable prompt caching (saves 2-3s per invocation)
-
-**Expected Results:**
-- Before: 40-60 seconds per complex query
-- After: 15-20 seconds per complex query
-
-## Monitoring
-
-### CloudWatch Logs
-- Log Group: `BedrockLogging`
-- Metrics to track:
-  - `latencyMs` per agent
-  - `inputTokens` and `outputTokens`
-  - Error rates
-
-### Example Log Query:
 ```bash
-aws logs tail BedrockLogging --since 20m --region us-west-2 --format short | grep "latencyMs"
+# Deploy / update the agent
+source venv/bin/activate
+agentcore launch --auto-update-on-conflict
+
+# Invoke directly (CLI smoke test)
+agentcore invoke '{"prompt": "Hello"}'
+
+# Tail logs
+aws logs tail /aws/bedrock-agentcore/runtimes/queen_coordinator-agAC6uDNBA-DEFAULT \
+  --region us-west-2 --since 10m
 ```
 
-## Cost Estimation
+## Legacy Architecture
 
-**Per Query (Current - All Sonnet):**
-- Input: ~14K tokens × $0.003/1K = $0.042
-- Output: ~1.5K tokens × $0.015/1K = $0.023
-- **Total**: ~$0.065 per query
+The original implementation used 4 separate Bedrock Agents with native Agent Collaboration. Each agent invocation added 10–20 seconds of overhead. That code is preserved in `agents/_legacy/` for reference.
 
-**Per Query (Optimized - Haiku for Analysis):**
-- **Total**: ~$0.045 per query
-- **Savings**: 30% cost reduction
+```
+Old: UI → Bedrock Coordinator → Data Source Agent → Smart Retrieval Agent → Analysis Agent
+          (10-20s each hop)      (10-20s)             (10-20s)               (10-20s)
+          Total: 40-60s
 
-## Troubleshooting
-
-### Issue: Agents not collaborating
-- **Solution**: Check Agent Collaboration configuration in Bedrock Console
-- Verify agent aliases are correct
-- Check IAM permissions for agent-to-agent communication
-
-### Issue: Lambda timeouts
-- **Solution**: Increase Lambda timeout to 60 seconds
-- Optimize SQL queries
-- Add database connection pooling
-
-### Issue: High latency
-- **Solution**: See `OPTIMIZATION_RECOMMENDATIONS.md`
-- Switch to Haiku for Analysis Agent
-- Enable prompt caching
-- Enable direct response from Analysis Agent
-
-## Support
-
-For questions or issues:
-1. Check CloudWatch logs: `BedrockLogging`
-2. Review agent configurations in Bedrock Console
-3. Test Lambda functions independently
-4. Verify database connectivity
-
+New: UI → AgentCore Runtime → [Coordinator → Specialist → Analysis] (all in-process)
+          Total: 3-8s
+```

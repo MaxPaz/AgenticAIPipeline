@@ -1,0 +1,5 @@
+# Data Source Agent Requirements
+# This agent determines what data sources are available for a given question
+
+boto3>=1.34.0
+botocore>=1.34.0

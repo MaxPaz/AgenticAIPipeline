@@ -2,11 +2,14 @@
 boto3>=1.34.0
 botocore>=1.34.0
 
+# AgentCore Runtime SDK
+bedrock-agentcore-starter-toolkit
+
+# Strands Agents SDK (requires Python 3.10+)
+strands-agents
+
 # Streamlit for UI
 streamlit>=1.30.0
-
-# Bedrock Agent dependencies
-# Note: For Browser Agent (external search), see Browser Agent/requirements.txt
 
 # Additional utilities
 python-dotenv>=1.0.0
